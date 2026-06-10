@@ -27,3 +27,5 @@ export type {
   WorkerRecord,
   WorkerStatus,
 } from './workerEvents.js';
+export { getArtifact, insertArtifact, listArtifacts } from './artifacts.js';
+export type { ArtifactRecord, ArtifactStats } from './artifacts.js';

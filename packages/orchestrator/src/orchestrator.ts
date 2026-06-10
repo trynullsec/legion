@@ -1,22 +1,38 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { readFile, mkdir } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { IllegalTransitionError, PlanSchema, type Plan } from '@legion/core';
+import {
+  IllegalTransitionError,
+  PlanSchema,
+  ReviewSchema,
+  type Plan,
+  type Review,
+} from '@legion/core';
 import {
   appendEvent,
   appendWorkerEvent,
   getMission,
   getMissionEvents,
+  getWorkerEvents,
   getWorkerRecord,
+  insertArtifact,
   listMissionWorkers,
   MissionNotFoundError,
+  type ArtifactStats,
+  type MissionRecord,
 } from '@legion/db';
 import type { WorkerSupervisor } from '@legion/runtime';
 import type { Pool } from 'pg';
-import { buildPlannerPrompt, type RejectionFeedback } from './prompt.js';
+import {
+  buildCoderPrompt,
+  buildPlannerPrompt,
+  buildReviewerPrompt,
+  buildRevisionPrompt,
+  type RejectionFeedback,
+} from './prompt.js';
 
 const exec = promisify(execFile);
 
@@ -45,15 +61,59 @@ export type PlanningOutcome =
   | { kind: 'INVALID'; issues: unknown[] }
   | { kind: 'WORKER_DID_NOT_EXIT_CLEANLY'; status: string };
 
+export class BuildStateError extends Error {
+  constructor(
+    readonly missionId: string,
+    readonly state: string,
+  ) {
+    super(`mission ${missionId} cannot start a build from state ${state}`);
+    this.name = 'BuildStateError';
+  }
+}
+
+export class BuildInProgressError extends Error {
+  constructor(readonly missionId: string) {
+    super(`mission ${missionId} already has a running build attempt`);
+    this.name = 'BuildInProgressError';
+  }
+}
+
+export type BuildOutcome =
+  | { kind: 'COMPLETED'; artifactId: string }
+  | { kind: 'ATTEMPT_FAILED'; reason: string };
+
+/** Internal-only overrides for deterministic tests (never exposed over HTTP). */
+export interface BuildOverrides {
+  coderTaskOverride?: string;
+  coderRevisionTaskOverride?: string;
+  /** One per review cycle (index 0 = first review). */
+  reviewerTaskOverrides?: string[];
+}
+
+const CODER_GIT_ENV = {
+  GIT_AUTHOR_NAME: 'Legion Coder',
+  GIT_AUTHOR_EMAIL: 'coder@legion.local',
+  GIT_COMMITTER_NAME: 'Legion Coder',
+  GIT_COMMITTER_EMAIL: 'coder@legion.local',
+};
+
 export interface OrchestratorOptions {
   pool: Pool;
   supervisor: WorkerSupervisor;
   /** Per-role model override; defaults to env LEGION_MODEL_PLANNER, then the M1 default. */
   plannerModel?: string;
+  /** Reviewer model; defaults to env LEGION_MODEL_REVIEWER, then the M1 default. */
+  reviewerModel?: string;
+  /** Coder model; defaults to env LEGION_MODEL_CODER, then the M1 default. */
+  coderModel?: string;
   /** Planner hard timeout; defaults to the supervisor's configured timeout. */
   plannerTimeoutMs?: number;
   /** Root for planner workdirs (tests point this into the repo's .tmp). */
   workdirRoot?: string;
+  /** Root for build attempt workspaces; default ~/.legion/builds. */
+  buildsRoot?: string;
+  /** Root for diff artifacts; default ~/.legion/artifacts. */
+  artifactsRoot?: string;
 }
 
 /**
@@ -65,17 +125,33 @@ export class Orchestrator {
   private readonly pool: Pool;
   private readonly supervisor: WorkerSupervisor;
   private readonly plannerModel: string | undefined;
+  private readonly reviewerModel: string | undefined;
+  private readonly coderModel: string | undefined;
   private readonly plannerTimeoutMs: number | undefined;
   private readonly workdirRoot: string;
+  private readonly buildsRoot: string;
+  private readonly artifactsRoot: string;
+  private readonly activeBuilds = new Set<string>();
 
   constructor(options: OrchestratorOptions) {
     this.pool = options.pool;
     this.supervisor = options.supervisor;
     this.plannerModel =
       options.plannerModel ?? process.env.LEGION_MODEL_PLANNER ?? undefined;
+    this.reviewerModel =
+      options.reviewerModel ?? process.env.LEGION_MODEL_REVIEWER ?? undefined;
+    // The coder default differs from the M1 general default: gpt-oss-120b
+    // reliably *reads* but often stops without acting on multi-step coding
+    // tasks. Qwen3 Coder is purpose-built for agentic coding and cheap.
+    this.coderModel =
+      options.coderModel ?? process.env.LEGION_MODEL_CODER ?? 'qwen/qwen3-coder';
     this.plannerTimeoutMs = options.plannerTimeoutMs;
     this.workdirRoot =
       options.workdirRoot ?? path.join(os.homedir(), '.legion', 'workdirs');
+    this.buildsRoot =
+      options.buildsRoot ?? path.join(os.homedir(), '.legion', 'builds');
+    this.artifactsRoot =
+      options.artifactsRoot ?? path.join(os.homedir(), '.legion', 'artifacts');
   }
 
   /**
@@ -109,21 +185,35 @@ export class Orchestrator {
       await appendEvent(this.pool, missionId, 'PLANNING_STARTED');
     }
 
-    // The planner NEVER touches the user's repository: shallow-clone it into
-    // the worker's isolated workdir. file:// keeps --depth 1 honest locally.
+    const prompt =
+      options.taskOverride ??
+      buildPlannerPrompt(mission, await this.rejectionFeedback(missionId));
+
+    const spawned = await this.spawnPlanner(missionId, mission.repoPath, prompt);
+    const settled = this.finishPlanning(
+      missionId, mission.repoPath, spawned.workerId, spawned.workdir, prompt, 1,
+    );
+    return { workerId: spawned.workerId, settled };
+  }
+
+  /**
+   * Clone the mission repo into a fresh isolated workdir and spawn a planner.
+   * The planner NEVER touches the user's repository — file:// shallow clone.
+   */
+  private async spawnPlanner(
+    missionId: string,
+    repoPath: string,
+    prompt: string,
+  ): Promise<{ workerId: string; workdir: string }> {
     const workdir = path.join(this.workdirRoot, missionId, `planner-${randomUUID()}`);
     await mkdir(path.dirname(workdir), { recursive: true });
     await exec('git', [
       'clone',
       '--depth',
       '1',
-      `file://${path.resolve(mission.repoPath)}`,
+      `file://${path.resolve(repoPath)}`,
       workdir,
     ]);
-
-    const prompt =
-      options.taskOverride ??
-      buildPlannerPrompt(mission, await this.rejectionFeedback(missionId));
 
     const workerId = await this.supervisor.startWorker({
       missionId,
@@ -142,8 +232,7 @@ export class Orchestrator {
       payload: { prompt, role: 'planner' },
     });
 
-    const settled = this.finishPlanning(missionId, workerId, workdir);
-    return { workerId, settled };
+    return { workerId, workdir };
   }
 
   private async rejectionFeedback(
@@ -167,8 +256,11 @@ export class Orchestrator {
 
   private async finishPlanning(
     missionId: string,
+    repoPath: string,
     workerId: string,
     workdir: string,
+    prompt: string,
+    run: number,
   ): Promise<PlanningOutcome> {
     const timeout = (this.plannerTimeoutMs ?? 10 * 60 * 1000) + 60_000;
     try {
@@ -185,13 +277,23 @@ export class Orchestrator {
       };
     }
 
+    const MAX_PLANNER_RUNS = 2;
     const invalid = async (issues: unknown[]): Promise<PlanningOutcome> => {
       await appendWorkerEvent(this.pool, {
         missionId,
         workerId,
         type: 'PLAN_INVALID',
-        payload: { issues },
+        payload: { issues, run },
       });
+      // One deterministic retry per attempt: a planner occasionally exits
+      // cleanly without writing plan.json. The failed run keeps its
+      // PLAN_INVALID record; one more real planner gets a chance.
+      if (run < MAX_PLANNER_RUNS) {
+        const next = await this.spawnPlanner(missionId, repoPath, prompt);
+        return this.finishPlanning(
+          missionId, repoPath, next.workerId, next.workdir, prompt, run + 1,
+        );
+      }
       return { kind: 'INVALID', issues };
     };
 
@@ -227,5 +329,352 @@ export class Orchestrator {
       throw e;
     }
     return { kind: 'PROPOSED', plan: validated.data };
+  }
+
+  // ====================================================================
+  // M3: build loop
+  // ====================================================================
+
+  /**
+   * Start one build attempt: clone the mission repo into a fresh attempt
+   * workspace, branch, spawn the coder. Returns once the first coder is
+   * running; `settled` resolves when the whole attempt (coder → review →
+   * optional revision → artifact) is processed.
+   */
+  async startBuild(
+    missionId: string,
+    overrides: BuildOverrides = {},
+  ): Promise<{ attempt: number; coderWorkerId: string; settled: Promise<BuildOutcome> }> {
+    const result = await getMission(this.pool, missionId);
+    if (!result) throw new MissionNotFoundError(missionId);
+    const mission = result.mission;
+    if (mission.state !== 'BUILDING') {
+      throw new BuildStateError(missionId, mission.state);
+    }
+
+    if (this.activeBuilds.has(missionId)) {
+      throw new BuildInProgressError(missionId);
+    }
+    const workers = await listMissionWorkers(this.pool, missionId);
+    const liveBuilder = workers.find(
+      (w) =>
+        (w.role === 'coder' || w.role === 'reviewer') &&
+        (w.status === 'STARTING' || w.status === 'RUNNING'),
+    );
+    if (liveBuilder) throw new BuildInProgressError(missionId);
+
+    const plan = await this.approvedPlan(missionId);
+
+    // attempt numbering from the filesystem (workspaces persist by design)
+    const missionBuilds = path.join(this.buildsRoot, missionId);
+    await mkdir(missionBuilds, { recursive: true });
+    const existing = (await readdir(missionBuilds)).filter((d) =>
+      d.startsWith('attempt-'),
+    );
+    const attempt = existing.length + 1;
+    const attemptDir = path.join(missionBuilds, `attempt-${attempt}`);
+    const repoDir = path.join(attemptDir, 'repo');
+    await mkdir(path.join(attemptDir, '.tmp'), { recursive: true });
+
+    // full local clone; the user's repo is never written
+    await exec('git', ['clone', `file://${path.resolve(mission.repoPath)}`, repoDir]);
+    // sever the link back to the user's repo so a push is impossible
+    await exec('git', ['-C', repoDir, 'remote', 'remove', 'origin']);
+    const baseSha = (
+      await exec('git', ['-C', repoDir, 'rev-parse', 'HEAD'])
+    ).stdout.trim();
+    const branch = `legion/${missionId.slice(0, 8)}`;
+    await exec('git', ['-C', repoDir, 'checkout', '-q', '-b', branch]);
+    // keep runtime droppings out of git's view of the worktree
+    await writeFile(path.join(repoDir, '.git', 'info', 'exclude'), '.tmp/\n');
+
+    const priorFailure = await this.lastAttemptFailureSummary(missionId);
+
+    this.activeBuilds.add(missionId);
+    try {
+      await appendEvent(this.pool, missionId, 'BUILD_STARTED', { attempt });
+
+      const coderEnv = {
+        ...CODER_GIT_ENV,
+        HOME: attemptDir, // hermes state lands outside the repo worktree
+        TMPDIR: path.join(attemptDir, '.tmp'),
+      };
+      const coderTask =
+        overrides.coderTaskOverride ??
+        buildCoderPrompt(mission, plan, priorFailure);
+      const coderWorkerId = await this.spawnBuildWorker(
+        missionId, 'coder', coderTask, repoDir, coderEnv,
+      );
+
+      const settled = this.runBuildAttempt({
+        missionId, mission, plan, overrides,
+        attempt, attemptDir, repoDir, baseSha,
+        firstCoderId: coderWorkerId, coderEnv,
+      }).finally(() => {
+        this.activeBuilds.delete(missionId);
+      });
+
+      return { attempt, coderWorkerId, settled };
+    } catch (e) {
+      this.activeBuilds.delete(missionId);
+      throw e;
+    }
+  }
+
+  private async spawnBuildWorker(
+    missionId: string,
+    role: 'coder' | 'reviewer',
+    task: string,
+    workdir: string,
+    extraEnv?: Record<string, string>,
+  ): Promise<string> {
+    const workerId = await this.supervisor.startWorker({
+      missionId,
+      role,
+      task,
+      workdir,
+      extraEnv,
+      model: role === 'coder' ? this.coderModel : this.reviewerModel,
+      // implementing a plan takes far more tool iterations than a review
+      maxTurns: role === 'coder' ? 40 : undefined,
+    });
+    await appendWorkerEvent(this.pool, {
+      missionId,
+      workerId,
+      type: 'WORKER_TASK',
+      payload: { prompt: task, role },
+    });
+    return workerId;
+  }
+
+  private async runBuildAttempt(ctx: {
+    missionId: string;
+    mission: MissionRecord;
+    plan: Plan;
+    overrides: BuildOverrides;
+    attempt: number;
+    attemptDir: string;
+    repoDir: string;
+    baseSha: string;
+    firstCoderId: string;
+    coderEnv: Record<string, string>;
+  }): Promise<BuildOutcome> {
+    const { missionId, mission, plan, overrides, attempt, attemptDir, repoDir, baseSha } = ctx;
+
+    let lastWorkerId = ctx.firstCoderId;
+    let review: Review | null = null;
+
+    const fail = async (reason: string): Promise<BuildOutcome> => {
+      await appendWorkerEvent(this.pool, {
+        missionId,
+        workerId: lastWorkerId,
+        type: 'BUILD_ATTEMPT_FAILED',
+        payload: {
+          attempt,
+          reason,
+          ...(review ? { reviewSummary: review.summary } : {}),
+        },
+      });
+      return { kind: 'ATTEMPT_FAILED', reason };
+    };
+
+    const MAX_CODER_CYCLES = 2;
+    for (let cycle = 1; cycle <= MAX_CODER_CYCLES; cycle++) {
+      let coderId = ctx.firstCoderId;
+      if (cycle > 1) {
+        const task =
+          overrides.coderRevisionTaskOverride ??
+          buildRevisionPrompt(mission, plan, review!.comments, review!.summary);
+        coderId = await this.spawnBuildWorker(
+          missionId, 'coder', task, repoDir, ctx.coderEnv,
+        );
+      }
+      lastWorkerId = coderId;
+
+      await this.waitForWorker(coderId);
+      const coder = await getWorkerRecord(this.pool, coderId);
+      if (coder?.status !== 'EXITED') {
+        return fail(`CODER_${coder?.status ?? 'UNKNOWN'}`);
+      }
+
+      const diff = (
+        await exec('git', ['-C', repoDir, 'diff', `${baseSha}..HEAD`], {
+          maxBuffer: 64 * 1024 * 1024,
+        })
+      ).stdout;
+      const commits = (
+        await exec('git', ['-C', repoDir, 'log', '--oneline', `${baseSha}..HEAD`])
+      ).stdout;
+
+      // A coder that exits cleanly but commits nothing produced no reviewable
+      // work — fail fast instead of burning a review cycle on an empty diff.
+      if (diff.trim().length === 0) {
+        return fail('EMPTY_DIFF');
+      }
+
+      const reviewerTask =
+        overrides.reviewerTaskOverrides?.[cycle - 1] ??
+        buildReviewerPrompt(plan, diff, commits);
+
+      // One deterministic retry per review cycle: a reviewer occasionally
+      // answers in chat instead of writing review.json. The failed run keeps
+      // its REVIEW_INVALID record; a second real reviewer gets one chance.
+      let parsed:
+        | { ok: true; review: Review }
+        | { ok: false; issues: unknown[] }
+        | null = null;
+      const MAX_REVIEWER_RUNS = 2;
+      for (let run = 1; run <= MAX_REVIEWER_RUNS; run++) {
+        const reviewDir = path.join(
+          attemptDir,
+          `review-${cycle}${run > 1 ? `-retry${run - 1}` : ''}`,
+        );
+        await mkdir(reviewDir, { recursive: true });
+        const reviewerId = await this.spawnBuildWorker(
+          missionId, 'reviewer', reviewerTask, reviewDir,
+        );
+        lastWorkerId = reviewerId;
+
+        await this.waitForWorker(reviewerId);
+        const reviewer = await getWorkerRecord(this.pool, reviewerId);
+        if (reviewer?.status !== 'EXITED') {
+          return fail(`REVIEWER_${reviewer?.status ?? 'UNKNOWN'}`);
+        }
+
+        parsed = await this.readReview(path.join(reviewDir, 'review.json'));
+        if (parsed.ok) {
+          review = parsed.review;
+          // persist the verdict for the board
+          await appendWorkerEvent(this.pool, {
+            missionId,
+            workerId: reviewerId,
+            type: 'REVIEW_RESULT',
+            payload: { ...review, cycle },
+          });
+          break;
+        }
+        await appendWorkerEvent(this.pool, {
+          missionId,
+          workerId: reviewerId,
+          type: 'REVIEW_INVALID',
+          payload: { issues: parsed.issues, run },
+        });
+      }
+      if (!parsed?.ok || !review) {
+        return fail('REVIEW_INVALID');
+      }
+
+      if (review.verdict === 'approve') {
+        const artifactId = await this.publishArtifact(
+          missionId, repoDir, baseSha, diff, review.summary,
+        );
+        return { kind: 'COMPLETED', artifactId };
+      }
+    }
+
+    return fail('REVIEW_EXHAUSTED');
+  }
+
+  private async waitForWorker(workerId: string): Promise<void> {
+    const timeout = (this.plannerTimeoutMs ?? 10 * 60 * 1000) + 60_000;
+    try {
+      await this.supervisor.waitForExit(workerId, timeout);
+    } catch {
+      /* status decides */
+    }
+  }
+
+  private async readReview(
+    file: string,
+  ): Promise<{ ok: true; review: Review } | { ok: false; issues: unknown[] }> {
+    let raw: string;
+    try {
+      raw = await readFile(file, 'utf8');
+    } catch {
+      return { ok: false, issues: [{ message: 'review.json missing from workdir root' }] };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return { ok: false, issues: [{ message: `review.json is not valid JSON: ${String(e)}` }] };
+    }
+    const validated = ReviewSchema.safeParse(parsed);
+    if (!validated.success) return { ok: false, issues: validated.error.issues };
+    return { ok: true, review: validated.data };
+  }
+
+  private async publishArtifact(
+    missionId: string,
+    repoDir: string,
+    baseSha: string,
+    diff: string,
+    reviewSummary: string,
+  ): Promise<string> {
+    const shortstat = (
+      await exec('git', ['-C', repoDir, 'diff', '--shortstat', `${baseSha}..HEAD`])
+    ).stdout;
+    const stats: ArtifactStats = {
+      files: Number(shortstat.match(/(\d+) files? changed/)?.[1] ?? 0),
+      insertions: Number(shortstat.match(/(\d+) insertions?\(\+\)/)?.[1] ?? 0),
+      deletions: Number(shortstat.match(/(\d+) deletions?\(-\)/)?.[1] ?? 0),
+      commits: Number(
+        (
+          await exec('git', ['-C', repoDir, 'rev-list', '--count', `${baseSha}..HEAD`])
+        ).stdout.trim(),
+      ),
+    };
+
+    const artifactId = randomUUID();
+    const dir = path.join(this.artifactsRoot, missionId);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `${artifactId}.diff`);
+    await writeFile(filePath, diff);
+    const sha256 = createHash('sha256').update(diff).digest('hex');
+
+    await insertArtifact(this.pool, {
+      id: artifactId,
+      missionId,
+      type: 'diff',
+      path: filePath,
+      sha256,
+      stats,
+    });
+
+    // mission_events carry the artifact reference, never the diff body
+    await appendEvent(this.pool, missionId, 'BUILD_COMPLETED', {
+      artifactId,
+      sha256,
+      stats,
+      reviewSummary,
+    });
+    return artifactId;
+  }
+
+  private async approvedPlan(missionId: string): Promise<Plan> {
+    const events = await getMissionEvents(this.pool, missionId);
+    const proposed = [...events].reverse().find((e) => e.type === 'PLAN_PROPOSED');
+    if (!proposed) {
+      throw new BuildStateError(missionId, 'BUILDING (no approved plan found)');
+    }
+    return (proposed.payload as { plan: Plan }).plan;
+  }
+
+  /** Latest BUILD_ATTEMPT_FAILED review summary across the mission's workers. */
+  private async lastAttemptFailureSummary(missionId: string): Promise<string | null> {
+    const workers = await listMissionWorkers(this.pool, missionId);
+    let latest: { at: string; summary: string } | null = null;
+    for (const w of workers) {
+      const events = await getWorkerEvents(this.pool, w.workerId);
+      for (const e of events) {
+        if (e.type !== 'BUILD_ATTEMPT_FAILED') continue;
+        const summary = e.payload.reviewSummary as string | undefined;
+        if (!summary) continue;
+        if (!latest || e.recordedAt > latest.at) {
+          latest = { at: e.recordedAt, summary };
+        }
+      }
+    }
+    return latest?.summary ?? null;
   }
 }

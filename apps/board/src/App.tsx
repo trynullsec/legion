@@ -1,17 +1,22 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   approvePlan,
+  fetchArtifactContent,
+  fetchArtifacts,
   fetchMission,
   fetchMissions,
   fetchWorkerEvents,
   fetchWorkers,
   postMission,
   rejectPlan,
+  startBuild,
   startPlanning,
+  type Artifact,
   type Mission,
   type MissionEvent,
   type MissionState,
   type Plan,
+  type ReviewResult,
   type RiskLevel,
   type Worker,
   type WorkerEvent,
@@ -237,6 +242,129 @@ function PlanSection({
   );
 }
 
+function diffLineClass(line: string): string {
+  if (line.startsWith('diff --git') || line.startsWith('index ')) return 'd-file';
+  if (line.startsWith('@@')) return 'd-hunk';
+  if (line.startsWith('+')) return 'd-add';
+  if (line.startsWith('-')) return 'd-del';
+  return 'd-ctx';
+}
+
+function BuildSection({ mission }: { mission: Mission }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [diff, setDiff] = useState<string | null>(null);
+  const [review, setReview] = useState<ReviewResult | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setArtifacts(await fetchArtifacts(mission.missionId));
+      // latest reviewer verdict from worker trajectories
+      const workers = await fetchWorkers(mission.missionId);
+      const reviewers = workers.filter((w) => w.role === 'reviewer');
+      const last = reviewers[reviewers.length - 1];
+      if (last) {
+        const events = await fetchWorkerEvents(last.workerId);
+        const result = [...events]
+          .reverse()
+          .find((e) => e.type === 'REVIEW_RESULT');
+        setReview(result ? (result.payload as unknown as ReviewResult) : null);
+      }
+    } catch {
+      /* build API optional in dev */
+    }
+  }, [mission.missionId]);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), POLL_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const buildable = mission.state === 'BUILDING';
+  if (!buildable && artifacts.length === 0 && !review) return null;
+
+  return (
+    <section className="build">
+      <h3>Build</h3>
+      {error && <p className="error">{error}</p>}
+      {buildable && (
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            startBuild(mission.missionId)
+              .then(() => load())
+              .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          {busy ? 'Working…' : 'Start build'}
+        </button>
+      )}
+
+      {review && (
+        <div className="review-box">
+          <p>
+            <span className={`mono chip chip-${review.verdict === 'approve' ? 'EXITED' : 'FAILED'}`}>
+              {review.verdict}
+            </span>{' '}
+            {review.summary}
+          </p>
+          {review.comments.length > 0 && (
+            <ul>
+              {review.comments.map((cm, i) => (
+                <li key={i}>
+                  <span className={`mono badge badge-${cm.severity === 'must_fix' ? 'high' : cm.severity === 'should_fix' ? 'medium' : 'low'}`}>
+                    {cm.severity}
+                  </span>{' '}
+                  <span className="mono files">{cm.file ?? '(general)'}</span> {cm.body}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {artifacts.length > 0 && (
+        <div className="artifact-list">
+          {artifacts.map((a) => (
+            <button
+              key={a.id}
+              className="worker-chip"
+              onClick={() =>
+                void fetchArtifactContent(a.id)
+                  .then((r) => setDiff(r.content))
+                  .catch((e) => setError(String(e)))
+              }
+            >
+              <span className="mono">{a.type}</span>
+              <span className="mono small">
+                {a.stats.files} files +{a.stats.insertions} −{a.stats.deletions} ·{' '}
+                {a.stats.commits} commits
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {diff !== null && (
+        <pre className="diff-view">
+          {diff.split('\n').map((line, i) => (
+            <span key={i} className={diffLineClass(line)}>
+              {line}
+              {'\n'}
+            </span>
+          ))}
+        </pre>
+      )}
+    </section>
+  );
+}
+
 function WorkersSection({ missionId }: { missionId: string }) {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -383,6 +511,7 @@ function MissionDetail({
             events={events}
             onChanged={() => void load()}
           />
+          <BuildSection mission={mission} />
           <WorkersSection missionId={missionId} />
         </>
       )}

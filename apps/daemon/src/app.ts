@@ -8,8 +8,10 @@ import {
 import {
   appendEvent,
   createMission,
+  getArtifact,
   getMission,
   getStateAsOf,
+  listArtifacts,
   listMissions,
   MissionNotFoundError,
   type MissionRecord,
@@ -21,38 +23,67 @@ import {
   type WorkerSupervisor,
 } from '@legion/runtime';
 import {
+  BuildInProgressError,
+  BuildStateError,
   PlanningInProgressError,
   PlanningStateError,
   type Orchestrator,
 } from '@legion/orchestrator';
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { Pool } from 'pg';
 
-const createMissionSchema = z.object({
-  title: z.string().min(1),
-  objective: z.string().min(1),
-  repoPath: z.string().min(1),
-  riskLevel: z.enum(RISK_LEVELS),
-});
+// Every HTTP boundary schema is strict: unknown keys (e.g. smuggled internal
+// overrides like taskOverride) are rejected with 400, never passed through.
+const createMissionSchema = z
+  .object({
+    title: z.string().min(1),
+    objective: z.string().min(1),
+    repoPath: z.string().min(1),
+    riskLevel: z.enum(RISK_LEVELS),
+  })
+  .strict();
 
-const appendEventSchema = z.object({
-  type: z.enum(EVENT_TYPES),
-  payload: z.record(z.unknown()).optional(),
-});
+const appendEventSchema = z
+  .object({
+    type: z.enum(EVENT_TYPES),
+    payload: z.record(z.unknown()).optional(),
+  })
+  .strict();
 
-const spawnWorkerSchema = z.object({
-  role: z.string().min(1),
-  task: z.string().min(1),
-  workdir: z.string().min(1).optional(),
-  timeoutMs: z.number().int().positive().optional(),
-});
+const spawnWorkerSchema = z
+  .object({
+    role: z.string().min(1),
+    task: z.string().min(1),
+    workdir: z.string().min(1).optional(),
+    timeoutMs: z.number().int().positive().optional(),
+  })
+  .strict();
 
-const stopWorkerSchema = z.object({
-  graceful: z.boolean(),
-});
+const stopWorkerSchema = z
+  .object({
+    graceful: z.boolean(),
+  })
+  .strict();
 
-const rejectPlanSchema = z.object({
-  reason: z.string().min(1),
-});
+const rejectPlanSchema = z
+  .object({
+    reason: z.string().min(1),
+  })
+  .strict();
+
+/** Routes that take no body still reject any unknown keys (pin 9). */
+const emptyBodySchema = z.object({}).strict();
+
+async function readEmptyBody(c: Context): Promise<boolean> {
+  let body: unknown = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    body = {};
+  }
+  return emptyBodySchema.safeParse(body ?? {}).success;
+}
 
 // Timestamps arrive from @legion/db as microsecond-precision UTC strings and
 // are passed through untouched — never round-tripped through a JS Date.
@@ -194,6 +225,12 @@ export function createApp(
 
   app.post('/api/missions/:id/plan', async (c) => {
     const orch = requireOrchestrator();
+    if (!(await readEmptyBody(c))) {
+      return c.json(
+        { error: 'VALIDATION', message: 'this route accepts no body fields' },
+        400,
+      );
+    }
     const missionId = c.req.param('id');
     try {
       const { workerId, settled } = await orch.startPlanning(missionId);
@@ -260,6 +297,66 @@ export function createApp(
       return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
     }
     return planDecision(c, 'PLAN_REJECTED', { reason: parsed.data.reason });
+  });
+
+  // ---------- M3: build loop ----------
+
+  app.post('/api/missions/:id/build', async (c) => {
+    const orch = requireOrchestrator();
+    if (!(await readEmptyBody(c))) {
+      return c.json(
+        { error: 'VALIDATION', message: 'this route accepts no body fields' },
+        400,
+      );
+    }
+    const missionId = c.req.param('id');
+    try {
+      const { attempt, coderWorkerId, settled } = await orch.startBuild(missionId);
+      void settled.catch((e) =>
+        console.error(`build attempt for ${missionId} failed:`, e),
+      );
+      return c.json({ attempt, coderWorkerId }, 202);
+    } catch (e) {
+      if (e instanceof MissionNotFoundError) {
+        return c.json({ error: 'NOT_FOUND' }, 404);
+      }
+      if (e instanceof BuildStateError) {
+        return c.json(
+          { error: 'INVALID_STATE', missionId: e.missionId, state: e.state },
+          409,
+        );
+      }
+      if (e instanceof BuildInProgressError) {
+        return c.json({ error: 'BUILD_IN_PROGRESS' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.get('/api/missions/:id/artifacts', async (c) => {
+    const artifacts = await listArtifacts(pool, c.req.param('id'));
+    return c.json({ artifacts });
+  });
+
+  app.get('/api/artifacts/:id', async (c) => {
+    const artifact = await getArtifact(pool, c.req.param('id'));
+    if (!artifact) {
+      return c.json({ error: 'NOT_FOUND' }, 404);
+    }
+    let content: string;
+    try {
+      content = await readFile(artifact.path, 'utf8');
+    } catch {
+      return c.json({ error: 'INTEGRITY', message: 'artifact file missing' }, 409);
+    }
+    const actual = createHash('sha256').update(content).digest('hex');
+    if (actual !== artifact.sha256) {
+      return c.json(
+        { error: 'INTEGRITY', expected: artifact.sha256, actual },
+        409,
+      );
+    }
+    return c.json({ artifact, content });
   });
 
   // ---------- M1: worker runtime ----------

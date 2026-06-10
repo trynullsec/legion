@@ -149,6 +149,42 @@ export async function rejectPlan(
   );
 }
 
+export interface Artifact {
+  id: string;
+  missionId: string;
+  type: string;
+  path: string;
+  sha256: string;
+  stats: { files: number; insertions: number; deletions: number; commits: number };
+  createdAt: string;
+}
+
+export interface ReviewResult {
+  verdict: 'approve' | 'request_changes';
+  comments: { file: string | null; severity: string; body: string }[];
+  summary: string;
+  cycle?: number;
+}
+
+export async function startBuild(missionId: string): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/build`, { method: 'POST' }),
+  );
+}
+
+export async function fetchArtifacts(missionId: string): Promise<Artifact[]> {
+  const data = await asJson<{ artifacts: Artifact[] }>(
+    await fetch(`/api/missions/${missionId}/artifacts`),
+  );
+  return data.artifacts;
+}
+
+export async function fetchArtifactContent(
+  id: string,
+): Promise<{ artifact: Artifact; content: string }> {
+  return asJson(await fetch(`/api/artifacts/${id}`));
+}
+
 export async function postMission(input: NewMission): Promise<Mission> {
   const data = await asJson<{ mission: Mission }>(
     await fetch('/api/missions', {

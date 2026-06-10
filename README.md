@@ -170,18 +170,74 @@ POST /api/missions/:id/plan/approve  → PLAN_APPROVED (→ BUILDING; 409 otherw
 POST /api/missions/:id/plan/reject   {reason} → PLAN_REJECTED (→ PLANNING)
 ```
 
+## Build loop (Milestone 3)
+
+A coder agent implements the approved plan on a branch in an isolated
+workspace, a reviewer agent reviews the diff, and the result is a durable
+diff artifact. The user's repository is never written — merge is M5.
+
+- **Workspace/attempt model.** Each `POST /build` creates
+  `~/.legion/builds/<missionId>/attempt-<n>/repo`: a full local clone
+  (file:// only, no credentials) with the `origin` remote removed so a push
+  back to the user's repo is structurally impossible, on a fresh branch
+  `legion/<missionId-short>`. The coder works only there. Failed attempt
+  workspaces persist on disk for inspection.
+- **Coder contract.** The coder's prompt embeds the approved plan (steps,
+  files, risks) and requires real git commits — one per plan step where
+  sensible, messages referencing step numbers. Identity comes from
+  `GIT_AUTHOR/COMMITTER` env ("Legion Coder <coder@legion.local>") on top of
+  the M1 allowlist. `HOME` points at the attempt dir so agent state never
+  dirties the worktree. Default coder model: `qwen/qwen3-coder`
+  (purpose-built for agentic coding — `gpt-oss-120b` reliably reads but
+  often stops without acting on multi-step coding tasks); override with
+  `LEGION_MODEL_CODER`.
+- **Review loop.** A second worker (role `reviewer`, `LEGION_MODEL_REVIEWER`,
+  default = planner default) receives plan + diff + commit list and writes
+  `review.json` (zod `Review` schema in core). `request_changes` → one more
+  coder cycle on the same branch with the comments embedded in its prompt
+  (recorded as `WORKER_TASK`). Max 2 coder cycles per attempt; still
+  rejected → `BUILD_ATTEMPT_FAILED` in worker_events, mission stays
+  BUILDING, and the next attempt's coder prompt references the failed
+  review summary. Empty diffs fail fast (`EMPTY_DIFF`) without burning a
+  review cycle. Planner and reviewer file-output runs get one deterministic
+  retry per attempt (the failed run keeps its `PLAN_INVALID`/`REVIEW_INVALID`
+  record) — real models occasionally answer in chat instead of writing the
+  file.
+- **Artifacts & integrity.** On approval the orchestrator writes
+  `git diff <base>..<branch>` to `~/.legion/artifacts/<missionId>/<id>.diff`,
+  stores `{files, insertions, deletions, commits}` + sha256 in the
+  `artifacts` table, and emits `BUILD_COMPLETED {artifactId, sha256, stats,
+  reviewSummary}` (never diff bodies) → state SCANNING (parked until M4).
+  `GET /api/artifacts/:id` recomputes the hash on every read and returns
+  409 INTEGRITY on mismatch.
+
+### Build API
+
+```
+POST /api/missions/:id/build      → start attempt (202; 409 unless BUILDING / attempt running)
+GET  /api/missions/:id/artifacts  → artifact metadata list
+GET  /api/artifacts/:id           → metadata + diff content (integrity-checked)
+```
+
+All HTTP boundary schemas are strict: unknown keys — including internal
+spawn options like `taskOverride` — are rejected with 400 (T30).
+
 ### Updated cost estimate per full test run
 
-M1 worker tests ≈ $0.005 (five trivial spawns). M2 adds two full planner
-runs (repo inspection, ~10–15 model calls each ≈ $0.01 apiece) plus three
-short-lived spawns ≈ **$0.03 total per `pnpm test`**; budget $0.10 for
-headroom.
+M1 worker tests ≈ $0.005 (five trivial spawns). M2 planning ≈ $0.02–0.03
+(two real planner runs + short spawns). M3 is multi-agent: T24 runs a real
+coder (~10–25 calls on `qwen3-coder`, ≈ $0.01–0.02) plus a real reviewer
+(~$0.005); T25/T26 each run 2 coder + 2 reviewer workers but with trivial
+forced tasks except one real revision cycle in T25 (≈ $0.01–0.02 combined);
+T27–T29 are short-lived spawns. **Total ≈ $0.06–0.10 per `pnpm test`**;
+budget $0.25 for headroom (occasional planner/reviewer retries add one
+worker run each).
 
 ## Tests
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema |
+| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop (real planner, real repo clone, approval gate, rejection feedback, concurrency guard) |
+| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop (real planner, real repo clone, approval gate, rejection feedback, concurrency guard); T24–T30 build loop (real coder/reviewer, revision + exhaustion, artifact integrity, override smuggling) |
 | `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

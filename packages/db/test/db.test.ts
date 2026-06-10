@@ -23,6 +23,7 @@ beforeAll(async () => {
   // T1 precondition: a genuinely fresh database surface.
   await pool.query('drop table if exists mission_events cascade');
   await pool.query('drop table if exists worker_events cascade');
+  await pool.query('drop table if exists artifacts cascade');
   await pool.query('drop table if exists schema_migrations cascade');
   await runMigrations(pool);
 });

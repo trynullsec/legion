@@ -40,6 +40,10 @@ export interface StartWorkerInput {
   timeoutMs?: number;
   /** Per-role model override (additive; defaults to the configured model). */
   model?: string;
+  /** Extra allowlisted env vars (e.g. git identity for coder workers). */
+  extraEnv?: Record<string, string>;
+  /** Per-worker model-iteration budget (defaults to the configured maxTurns). */
+  maxTurns?: number;
 }
 
 interface LiveWorker {
@@ -140,7 +144,8 @@ export class WorkerSupervisor {
       LEGION_TASK: input.task,
       LEGION_MODEL: model,
       LEGION_BASE_URL: this.config.baseUrl,
-      LEGION_MAX_TURNS: String(this.config.maxTurns),
+      LEGION_MAX_TURNS: String(input.maxTurns ?? this.config.maxTurns),
+      ...input.extraEnv,
     };
 
     const child = spawn(this.config.venvPython, [this.config.launcherPath], {
