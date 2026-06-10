@@ -20,6 +20,7 @@ Worker runtime (Milestone 1) additionally needs:
 ```bash
 git submodule update --init        # vendor/hermes-agent @ v2026.6.5
 bash scripts/setup-workers.sh      # uv venv (Python 3.11) + hermes install
+bash scripts/setup-scanners.sh     # gitleaks 8.30.1 + semgrep 1.165.0 (M4)
 echo 'OPENROUTER_API_KEY=sk-or-...' >> .env
 ```
 
@@ -37,27 +38,31 @@ apps/board        React 18 + Vite — the Mission Board UI
 packages/core     pure mission domain logic (state machine), zero IO
 packages/db       Postgres access, raw SQL migrations (no ORM)
 packages/runtime  Hermes worker supervisor (M1)
-packages/orchestrator  planning flow: clone, prompt, validate, emit (M2)
+packages/orchestrator  planning + build + scan flows (M2–M4)
+packages/scanner  gitleaks + semgrep SARIF scan engine (M4)
+legion-rules      in-repo semgrep house rules (Legion source, M4)
 vendor/hermes-agent  vendored NousResearch/hermes-agent, pinned @ v2026.6.5
 ```
 
 ### Mission lifecycle
 
 ```
-                      PLAN_REJECTED
-                    ┌───────────────┐
-                    ▼               │
+                      PLAN_REJECTED                         SCAN_FAILED (M4: rework)
+                    ┌───────────────┐                    ┌──────────────────────┐
+                    ▼               │                    ▼                      │
 DRAFT ──► PLANNING ──► AWAITING_PLAN_APPROVAL ──► BUILDING ──► SCANNING ──► AWAITING_MERGE_APPROVAL ──► MERGED
   │PLANNING_ │PLAN_PROPOSED   │PLAN_APPROVED   │BUILD_      │SCAN_PASSED   │MERGE_APPROVED
   │STARTED   │                │                │COMPLETED   │              │
-  │          │                │                │            │SCAN_FAILED   │MERGE_REJECTED
-  │          │                │                │            ▼              ▼
+  │          │                │                │            │              │MERGE_REJECTED
+  │          │                │                │            │              ▼
   └──────────┴────────────────┴── MISSION_FAILED / MISSION_CANCELLED ──► FAILED / CANCELLED
                                   (from any non-terminal state)
 ```
 
 `BUILD_STARTED` and `SCAN_STARTED` are self-transitions inside BUILDING and
-SCANNING. Terminal states: MERGED, FAILED, CANCELLED.
+SCANNING. **M4 amendment**: `SCAN_FAILED` routes `SCANNING → BUILDING` for
+rework (no longer to FAILED); `MERGE_REJECTED` is the remaining `→ FAILED`
+route. Terminal states: MERGED, FAILED, CANCELLED.
 
 ### Why event sourcing
 
@@ -233,11 +238,68 @@ T27–T29 are short-lived spawns. **Total ≈ $0.06–0.10 per `pnpm test`**;
 budget $0.25 for headroom (occasional planner/reviewer retries add one
 worker run each).
 
+## Security scan stage (Milestone 4)
+
+Every build artifact is scanned before a human is asked to approve a merge.
+Legion's scan engine is self-contained — two vendored OSS scanners, no
+external/proprietary dependency.
+
+- **Engine** (`packages/scanner`): orchestrates **gitleaks 8.30.1** (secrets,
+  release binary) and **semgrep 1.165.0** (code patterns, isolated uv venv).
+  `scripts/setup-scanners.sh` installs both into `~/.legion/tools/`
+  (idempotent; pinned versions recorded here). Why these two: gitleaks is the
+  de-facto secret scanner with native SARIF and full git-history awareness;
+  semgrep is the leading open pattern engine with a large community ruleset
+  (`p/default`) plus our in-repo `legion-rules/` for deterministic house
+  rules. Both are vendored and never modified — gaps go in the report.
+- **Invocations** (exact):
+  - `gitleaks git --report-format sarif --report-path <tmp> --no-banner --exit-code 1 --log-opts=<base>..HEAD <repo>` — scans the attempt branch's commits over git history, so a secret that was added *and then deleted* still counts.
+  - `semgrep scan --sarif --output <tmp> --config p/default --config legion-rules --metrics=off --quiet <repo>` — scans the workspace checkout.
+- **Merged SARIF**: both outputs merge into one valid SARIF 2.1.0 document
+  (two `runs[]`, tool metadata preserved). Stored via the M3 `artifacts`
+  table as type `sarif` with the same sha256 integrity rules (tamper → 409
+  on read). `mission_events` carry only the artifact id + counts
+  `{errors, warnings, notes}`.
+- **Threshold** (`LEGION_SCAN_FAIL_LEVEL`, default `error`): SARIF level
+  `error` fails; `warning`/`note` pass but are recorded. Set `warning` to
+  fail on warnings too. gitleaks findings are force-mapped to `error` — a
+  hardcoded secret is never a warning. **Partial scans never pass**: if one
+  scanner succeeds and the other crashes, the attempt fails.
+- **Flow**: entering SCANNING (after `BUILD_COMPLETED`) auto-starts the scan
+  → `SCAN_STARTED`; both scanners run against the attempt workspace; zero
+  error-level findings → `SCAN_PASSED {sarifArtifactId, counts}` →
+  AWAITING_MERGE_APPROVAL; otherwise → `SCAN_FAILED {sarifArtifactId, counts}`
+  → **BUILDING** (rework). A scanner crash / invalid SARIF / unexpected exit
+  → `SCAN_ATTEMPT_FAILED` (stderr tail recorded), mission **stays** SCANNING,
+  `POST /scan` retries.
+- **Rework loop** (state-machine amendment): `SCAN_FAILED` now transitions
+  `SCANNING → BUILDING` (no longer `→ FAILED`). The next build attempt's
+  coder prompt embeds the scan findings (rule + file + message), exactly as
+  the M2/M3 prompt-feedback loops do. `MISSION_FAILED`/`MISSION_CANCELLED`
+  remain the only terminal-failure routes.
+
+### Scan API
+
+```
+POST /api/missions/:id/scan  → manual (re)trigger (202; 409 unless SCANNING / scan running)
+GET  /api/missions/:id/scan  → latest status, counts by severity, per-tool breakdown, artifact id
+```
+
+### Updated cost estimate per full test run
+
+Scans themselves cost nothing (local binaries). The agent spend is unchanged
+from M3 except M4 adds several real coder/reviewer builds for its scan
+fixtures (clean/secret/warning). **Total ≈ $0.12–0.20 per `pnpm test`**;
+budget $0.40 for headroom (planner/coder/reviewer retries under model load).
+First `pnpm test` after a fresh checkout also downloads gitleaks + the
+semgrep venv via `setup-scanners.sh` (no API cost).
+
 ## Tests
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema |
+| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework amendment |
+| `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop (real planner, real repo clone, approval gate, rejection feedback, concurrency guard); T24–T30 build loop (real coder/reviewer, revision + exhaustion, artifact integrity, override smuggling) |
+| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop; T24–T30 build loop; T33–T38 scan stage (real gitleaks+semgrep, clean/dirty/threshold/crash/integrity, route guards) |
 | `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

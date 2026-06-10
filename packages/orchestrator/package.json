@@ -13,6 +13,7 @@
     "@legion/core": "workspace:*",
     "@legion/db": "workspace:*",
     "@legion/runtime": "workspace:*",
+    "@legion/scanner": "workspace:*",
     "pg": "^8.13.1"
   },
   "devDependencies": {

@@ -4,12 +4,16 @@ export {
   Orchestrator,
   PlanningInProgressError,
   PlanningStateError,
+  ScanInProgressError,
+  ScanStateError,
 } from './orchestrator.js';
 export type {
   BuildOutcome,
   BuildOverrides,
   OrchestratorOptions,
   PlanningOutcome,
+  ScanOutcome,
+  ScanOverrides,
 } from './orchestrator.js';
 export {
   buildCoderPrompt,

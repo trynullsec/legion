@@ -29,3 +29,5 @@ export type {
 } from './workerEvents.js';
 export { getArtifact, insertArtifact, listArtifacts } from './artifacts.js';
 export type { ArtifactRecord, ArtifactStats } from './artifacts.js';
+export { insertScanAttempt, latestScanAttempt } from './scanAttempts.js';
+export type { ScanAttemptRecord, ScanStatus } from './scanAttempts.js';

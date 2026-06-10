@@ -162,9 +162,22 @@ describe('T5 (core): plan rejection loops back to PLANNING', () => {
   });
 });
 
-describe('scan failure and merge rejection terminate in FAILED', () => {
-  it('SCAN_FAILED folds to FAILED', () => {
-    const events: FoldEvent[] = [
+describe('T31: scan failure routes back to BUILDING (M4 amendment)', () => {
+  it('SCANNING -SCAN_FAILED-> BUILDING is encoded in the transition table', () => {
+    expect(TRANSITIONS.SCANNING.SCAN_FAILED).toBe('BUILDING');
+  });
+
+  it('the old SCAN_FAILED route to FAILED is gone — only MISSION_FAILED/CANCELLED terminate from SCANNING', () => {
+    const scanning = TRANSITIONS.SCANNING;
+    const toFailed = Object.entries(scanning)
+      .filter(([, to]) => to === 'FAILED')
+      .map(([event]) => event);
+    expect(toFailed).toEqual(['MISSION_FAILED']);
+    expect(scanning.MISSION_CANCELLED).toBe('CANCELLED');
+  });
+
+  it('SCAN_FAILED folds to BUILDING, and the rework loop completes to MERGED', () => {
+    const reworked: FoldEvent[] = [
       created(),
       ev('PLANNING_STARTED'),
       ev('PLAN_PROPOSED'),
@@ -174,9 +187,21 @@ describe('scan failure and merge rejection terminate in FAILED', () => {
       ev('SCAN_STARTED'),
       ev('SCAN_FAILED'),
     ];
-    expect(foldMission(MISSION_ID, events).state).toBe('FAILED');
-  });
+    expect(foldMission(MISSION_ID, reworked).state).toBe('BUILDING');
 
+    const completed: FoldEvent[] = [
+      ...reworked,
+      ev('BUILD_STARTED'),
+      ev('BUILD_COMPLETED'),
+      ev('SCAN_STARTED'),
+      ev('SCAN_PASSED'),
+      ev('MERGE_APPROVED'),
+    ];
+    expect(foldMission(MISSION_ID, completed).state).toBe('MERGED');
+  });
+});
+
+describe('merge rejection terminates in FAILED', () => {
   it('MERGE_REJECTED folds to FAILED', () => {
     const events: FoldEvent[] = [
       created(),

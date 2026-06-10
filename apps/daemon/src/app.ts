@@ -11,6 +11,7 @@ import {
   getArtifact,
   getMission,
   getStateAsOf,
+  latestScanAttempt,
   listArtifacts,
   listMissions,
   MissionNotFoundError,
@@ -27,6 +28,8 @@ import {
   BuildStateError,
   PlanningInProgressError,
   PlanningStateError,
+  ScanInProgressError,
+  ScanStateError,
   type Orchestrator,
 } from '@legion/orchestrator';
 import { createHash } from 'node:crypto';
@@ -331,6 +334,63 @@ export function createApp(
       }
       throw e;
     }
+  });
+
+  // ---------- M4: security scan stage ----------
+
+  app.post('/api/missions/:id/scan', async (c) => {
+    const orch = requireOrchestrator();
+    if (!(await readEmptyBody(c))) {
+      return c.json(
+        { error: 'VALIDATION', message: 'this route accepts no body fields' },
+        400,
+      );
+    }
+    const missionId = c.req.param('id');
+    try {
+      const { settled } = await orch.startScan(missionId);
+      void settled.catch((e) =>
+        console.error(`scan for ${missionId} failed:`, e),
+      );
+      return c.json({ started: true }, 202);
+    } catch (e) {
+      if (e instanceof MissionNotFoundError) {
+        return c.json({ error: 'NOT_FOUND' }, 404);
+      }
+      if (e instanceof ScanStateError) {
+        return c.json(
+          { error: 'INVALID_STATE', missionId: e.missionId, state: e.state },
+          409,
+        );
+      }
+      if (e instanceof ScanInProgressError) {
+        return c.json({ error: 'SCAN_IN_PROGRESS' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.get('/api/missions/:id/scan', async (c) => {
+    const missionId = c.req.param('id');
+    const mission = await getMission(pool, missionId);
+    if (!mission) {
+      return c.json({ error: 'NOT_FOUND' }, 404);
+    }
+    const scan = await latestScanAttempt(pool, missionId);
+    if (!scan) {
+      return c.json({ scan: null });
+    }
+    return c.json({
+      scan: {
+        id: scan.id,
+        status: scan.status,
+        counts: scan.counts,
+        toolBreakdown: scan.toolBreakdown,
+        sarifArtifactId: scan.sarifArtifactId,
+        stderrTail: scan.stderrTail,
+        createdAt: scan.createdAt,
+      },
+    });
   });
 
   app.get('/api/missions/:id/artifacts', async (c) => {

@@ -66,7 +66,9 @@ export const TRANSITIONS: Record<
   SCANNING: {
     SCAN_STARTED: 'SCANNING',
     SCAN_PASSED: 'AWAITING_MERGE_APPROVAL',
-    SCAN_FAILED: 'FAILED',
+    // M4 amendment: scan failures route back to BUILDING for rework;
+    // MISSION_FAILED / MISSION_CANCELLED are the only terminal routes.
+    SCAN_FAILED: 'BUILDING',
     MISSION_FAILED: 'FAILED',
     MISSION_CANCELLED: 'CANCELLED',
   },

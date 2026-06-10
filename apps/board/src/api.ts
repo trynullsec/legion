@@ -185,6 +185,79 @@ export async function fetchArtifactContent(
   return asJson(await fetch(`/api/artifacts/${id}`));
 }
 
+export interface ScanCounts {
+  errors: number;
+  warnings: number;
+  notes: number;
+}
+
+export interface ScanInfo {
+  id: string;
+  status: 'PASSED' | 'FAILED' | 'ATTEMPT_FAILED';
+  counts: ScanCounts;
+  toolBreakdown: Record<string, ScanCounts>;
+  sarifArtifactId: string | null;
+  stderrTail: string | null;
+  createdAt: string;
+}
+
+export interface ScanFinding {
+  tool: string;
+  ruleId: string;
+  level: string;
+  file: string | null;
+  line: number | null;
+  message: string;
+}
+
+export async function fetchScan(missionId: string): Promise<ScanInfo | null> {
+  const data = await asJson<{ scan: ScanInfo | null }>(
+    await fetch(`/api/missions/${missionId}/scan`),
+  );
+  return data.scan;
+}
+
+export async function startScan(missionId: string): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/scan`, { method: 'POST' }),
+  );
+}
+
+/** Flatten a merged SARIF document into board-renderable findings. */
+export function parseSarifFindings(content: string): ScanFinding[] {
+  const doc = JSON.parse(content) as {
+    runs: Array<{
+      tool: { driver: { name: string } };
+      results?: Array<{
+        ruleId?: string;
+        level?: string;
+        message?: { text?: string };
+        locations?: Array<{
+          physicalLocation?: {
+            artifactLocation?: { uri?: string };
+            region?: { startLine?: number };
+          };
+        }>;
+      }>;
+    }>;
+  };
+  const findings: ScanFinding[] = [];
+  for (const run of doc.runs) {
+    for (const r of run.results ?? []) {
+      const loc = r.locations?.[0]?.physicalLocation;
+      findings.push({
+        tool: run.tool.driver.name,
+        ruleId: r.ruleId ?? '(unknown)',
+        level: r.level ?? 'warning',
+        file: loc?.artifactLocation?.uri ?? null,
+        line: loc?.region?.startLine ?? null,
+        message: r.message?.text ?? '',
+      });
+    }
+  }
+  return findings;
+}
+
 export async function postMission(input: NewMission): Promise<Mission> {
   const data = await asJson<{ mission: Mission }>(
     await fetch('/api/missions', {

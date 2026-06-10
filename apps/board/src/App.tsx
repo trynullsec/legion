@@ -5,12 +5,15 @@ import {
   fetchArtifacts,
   fetchMission,
   fetchMissions,
+  fetchScan,
   fetchWorkerEvents,
   fetchWorkers,
+  parseSarifFindings,
   postMission,
   rejectPlan,
   startBuild,
   startPlanning,
+  startScan,
   type Artifact,
   type Mission,
   type MissionEvent,
@@ -18,6 +21,8 @@ import {
   type Plan,
   type ReviewResult,
   type RiskLevel,
+  type ScanFinding,
+  type ScanInfo,
   type Worker,
   type WorkerEvent,
 } from './api';
@@ -365,6 +370,144 @@ function BuildSection({ mission }: { mission: Mission }) {
   );
 }
 
+function ScanSection({ mission }: { mission: Mission }) {
+  const [scan, setScan] = useState<ScanInfo | null>(null);
+  const [findings, setFindings] = useState<ScanFinding[] | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setScan(await fetchScan(mission.missionId));
+    } catch {
+      /* scan API optional in dev */
+    }
+  }, [mission.missionId]);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), POLL_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const scannable = mission.state === 'SCANNING';
+  if (!scan && !scannable) return null;
+
+  const showFindings = async () => {
+    if (!scan?.sarifArtifactId) return;
+    try {
+      const res = await fetch(`/api/artifacts/${scan.sarifArtifactId}`);
+      const body = await res.json();
+      setFindings(parseSarifFindings(body.content));
+      setExpanded(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <section className="scan">
+      <h3>Security Scan</h3>
+      {error && <p className="error">{error}</p>}
+      {scannable && (
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            startScan(mission.missionId)
+              .then(() => load())
+              .catch((e) => setError(String(e)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          {busy ? 'Working…' : scan ? 'Re-run scan' : 'Run scan'}
+        </button>
+      )}
+      {scannable && !scan && (
+        <p className="mono small">scan runs automatically after a build completes</p>
+      )}
+      {scan && (
+        <div className="scan-box">
+          <p>
+            <span
+              className={`mono chip chip-${
+                scan.status === 'PASSED' ? 'EXITED' : 'FAILED'
+              }`}
+            >
+              {scan.status}
+            </span>{' '}
+            <span className="mono small">
+              {scan.counts.errors} errors · {scan.counts.warnings} warnings ·{' '}
+              {scan.counts.notes} notes
+            </span>
+          </p>
+          {scan.status === 'FAILED' && (
+            <p className="mono small route-note">
+              scan failed — mission routed back to building for rework
+            </p>
+          )}
+          {scan.status === 'ATTEMPT_FAILED' && (
+            <p className="mono small route-note">
+              scanner crashed — mission still scanning; re-run when ready
+              {scan.stderrTail && (
+                <>
+                  <br />
+                  {scan.stderrTail.slice(-200)}
+                </>
+              )}
+            </p>
+          )}
+          <p className="mono small">
+            {Object.entries(scan.toolBreakdown).map(([tool, c]) => (
+              <span key={tool} className="tool-chip">
+                {tool}: {c.errors}e/{c.warnings}w/{c.notes}n
+              </span>
+            ))}
+          </p>
+          {scan.sarifArtifactId && (
+            <p className="mono small">
+              <button className="linkish" onClick={() => void showFindings()}>
+                {expanded ? 'findings:' : 'show findings'}
+              </button>{' '}
+              <a
+                href={`/api/artifacts/${scan.sarifArtifactId}`}
+                target="_blank"
+                rel="noopener"
+              >
+                raw SARIF ↗
+              </a>
+            </p>
+          )}
+          {expanded && findings && (
+            <ul className="findings">
+              {findings.length === 0 && <li className="mono small">no findings</li>}
+              {findings.map((f, i) => (
+                <li key={i}>
+                  <span
+                    className={`mono badge badge-${
+                      f.level === 'error' ? 'high' : f.level === 'warning' ? 'medium' : 'low'
+                    }`}
+                  >
+                    {f.level}
+                  </span>{' '}
+                  <span className="mono">{f.tool}</span>{' '}
+                  <span className="mono">{f.ruleId}</span>{' '}
+                  <span className="mono files">
+                    {f.file ?? '?'}:{f.line ?? '?'}
+                  </span>{' '}
+                  {f.message.slice(0, 200)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function WorkersSection({ missionId }: { missionId: string }) {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -512,6 +655,7 @@ function MissionDetail({
             onChanged={() => void load()}
           />
           <BuildSection mission={mission} />
+          <ScanSection mission={mission} />
           <WorkersSection missionId={missionId} />
         </>
       )}

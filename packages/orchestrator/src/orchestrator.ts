@@ -14,16 +14,29 @@ import {
 import {
   appendEvent,
   appendWorkerEvent,
+  getArtifact,
   getMission,
   getMissionEvents,
   getWorkerEvents,
   getWorkerRecord,
   insertArtifact,
+  insertScanAttempt,
   listMissionWorkers,
   MissionNotFoundError,
   type ArtifactStats,
   type MissionRecord,
 } from '@legion/db';
+import {
+  countFindings,
+  listFindings,
+  mergeSarif,
+  runGitleaks,
+  runSemgrep,
+  ScannerCrashError,
+  verdict,
+  type FailLevel,
+  type SarifDocument,
+} from '@legion/scanner';
 import type { WorkerSupervisor } from '@legion/runtime';
 import type { Pool } from 'pg';
 import {
@@ -82,6 +95,35 @@ export type BuildOutcome =
   | { kind: 'COMPLETED'; artifactId: string }
   | { kind: 'ATTEMPT_FAILED'; reason: string };
 
+export class ScanStateError extends Error {
+  constructor(
+    readonly missionId: string,
+    readonly state: string,
+  ) {
+    super(`mission ${missionId} cannot scan from state ${state}`);
+    this.name = 'ScanStateError';
+  }
+}
+
+export class ScanInProgressError extends Error {
+  constructor(readonly missionId: string) {
+    super(`mission ${missionId} already has a scan running`);
+    this.name = 'ScanInProgressError';
+  }
+}
+
+export type ScanOutcome =
+  | { kind: 'PASSED'; sarifArtifactId: string; counts: { errors: number; warnings: number; notes: number } }
+  | { kind: 'FAILED'; sarifArtifactId: string; counts: { errors: number; warnings: number; notes: number } }
+  | { kind: 'ATTEMPT_FAILED'; tool: string; error: string };
+
+/** Internal-only scan options for deterministic tests (never over HTTP). */
+export interface ScanOverrides {
+  gitleaksBin?: string;
+  semgrepBin?: string;
+  failLevel?: FailLevel;
+}
+
 /** Internal-only overrides for deterministic tests (never exposed over HTTP). */
 export interface BuildOverrides {
   coderTaskOverride?: string;
@@ -132,14 +174,22 @@ export class Orchestrator {
   private readonly buildsRoot: string;
   private readonly artifactsRoot: string;
   private readonly activeBuilds = new Set<string>();
+  private readonly activeScans = new Set<string>();
 
   constructor(options: OrchestratorOptions) {
     this.pool = options.pool;
     this.supervisor = options.supervisor;
+    // Planning must reliably *produce* plan.json. gpt-oss-120b frequently
+    // returns empty/thinking-only responses and exits without writing the
+    // file; qwen3-coder is dependable at this agentic file work (proven by
+    // the M3 coder). Documented in the README.
     this.plannerModel =
-      options.plannerModel ?? process.env.LEGION_MODEL_PLANNER ?? undefined;
+      options.plannerModel ?? process.env.LEGION_MODEL_PLANNER ?? 'qwen/qwen3-coder';
+    // Pin 4: reviewer default = planner default (both produce a JSON file).
     this.reviewerModel =
-      options.reviewerModel ?? process.env.LEGION_MODEL_REVIEWER ?? undefined;
+      options.reviewerModel ??
+      process.env.LEGION_MODEL_REVIEWER ??
+      this.plannerModel;
     // The coder default differs from the M1 general default: gpt-oss-120b
     // reliably *reads* but often stops without acting on multi-step coding
     // tasks. Qwen3 Coder is purpose-built for agentic coding and cheap.
@@ -277,7 +327,7 @@ export class Orchestrator {
       };
     }
 
-    const MAX_PLANNER_RUNS = 2;
+    const MAX_PLANNER_RUNS = 3;
     const invalid = async (issues: unknown[]): Promise<PlanningOutcome> => {
       await appendWorkerEvent(this.pool, {
         missionId,
@@ -387,8 +437,16 @@ export class Orchestrator {
     await exec('git', ['-C', repoDir, 'checkout', '-q', '-b', branch]);
     // keep runtime droppings out of git's view of the worktree
     await writeFile(path.join(repoDir, '.git', 'info', 'exclude'), '.tmp/\n');
+    // recorded for the scan stage: the diff/scan base of this attempt
+    await writeFile(path.join(attemptDir, 'base.sha'), `${baseSha}\n`);
 
-    const priorFailure = await this.lastAttemptFailureSummary(missionId);
+    // A build entered from a scan failure must carry the findings (pin 3);
+    // otherwise fall back to a prior failed-review summary (M3).
+    const scanFindings = await this.lastScanFailureFindings(missionId);
+    const priorFailure =
+      scanFindings !== null
+        ? `the previous build failed the security scan. Fix these findings:\n${scanFindings}`
+        : await this.lastAttemptFailureSummary(missionId);
 
     this.activeBuilds.add(missionId);
     try {
@@ -638,7 +696,7 @@ export class Orchestrator {
       type: 'diff',
       path: filePath,
       sha256,
-      stats,
+      stats: { ...stats },
     });
 
     // mission_events carry the artifact reference, never the diff body
@@ -648,7 +706,172 @@ export class Orchestrator {
       stats,
       reviewSummary,
     });
+
+    // M4: entering SCANNING auto-starts the scan. Failures here are the
+    // scan's own concern (SCAN_ATTEMPT_FAILED) — never the build's.
+    try {
+      const { settled } = await this.startScan(missionId);
+      void settled.catch((e) =>
+        console.error(`auto-scan for ${missionId} failed:`, e),
+      );
+    } catch (e) {
+      console.error(`auto-scan for ${missionId} could not start:`, e);
+    }
     return artifactId;
+  }
+
+  // ====================================================================
+  // M4: security scan stage
+  // ====================================================================
+
+  /**
+   * Run both scanners against the latest build attempt workspace. Auto-runs
+   * after BUILD_COMPLETED; POST /scan retriggers manually (e.g. after a
+   * scanner crash). One scan at a time per mission.
+   */
+  async startScan(
+    missionId: string,
+    overrides: ScanOverrides = {},
+  ): Promise<{ settled: Promise<ScanOutcome> }> {
+    const result = await getMission(this.pool, missionId);
+    if (!result) throw new MissionNotFoundError(missionId);
+    if (result.mission.state !== 'SCANNING') {
+      throw new ScanStateError(missionId, result.mission.state);
+    }
+    if (this.activeScans.has(missionId)) {
+      throw new ScanInProgressError(missionId);
+    }
+
+    // latest attempt workspace + its recorded scan base
+    const missionBuilds = path.join(this.buildsRoot, missionId);
+    const attempts = (await readdir(missionBuilds))
+      .filter((d) => d.startsWith('attempt-'))
+      .map((d) => Number(d.slice('attempt-'.length)))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => b - a);
+    const latest = attempts[0];
+    if (latest === undefined) {
+      throw new ScanStateError(missionId, 'SCANNING (no build workspace found)');
+    }
+    const attemptDir = path.join(missionBuilds, `attempt-${latest}`);
+    const repoDir = path.join(attemptDir, 'repo');
+    const baseSha = (await readFile(path.join(attemptDir, 'base.sha'), 'utf8')).trim();
+
+    this.activeScans.add(missionId);
+    await appendEvent(this.pool, missionId, 'SCAN_STARTED', { attempt: latest });
+
+    const settled = this.runScan(missionId, repoDir, baseSha, overrides).finally(
+      () => {
+        this.activeScans.delete(missionId);
+      },
+    );
+    return { settled };
+  }
+
+  private async runScan(
+    missionId: string,
+    repoDir: string,
+    baseSha: string,
+    overrides: ScanOverrides,
+  ): Promise<ScanOutcome> {
+    const failLevel: FailLevel =
+      overrides.failLevel ??
+      (process.env.LEGION_SCAN_FAIL_LEVEL === 'warning' ? 'warning' : 'error');
+
+    // Both scanners must succeed — a partial scan never passes a mission.
+    let gitleaksDoc: SarifDocument;
+    let semgrepDoc: SarifDocument;
+    try {
+      gitleaksDoc = await runGitleaks(repoDir, baseSha, {
+        gitleaksBin: overrides.gitleaksBin,
+      });
+      semgrepDoc = await runSemgrep(repoDir, undefined, {
+        semgrepBin: overrides.semgrepBin,
+      });
+    } catch (e) {
+      const tool = e instanceof ScannerCrashError ? e.tool : 'scanner';
+      const stderrTail =
+        e instanceof ScannerCrashError ? e.stderrTail : String(e);
+      await insertScanAttempt(this.pool, {
+        missionId,
+        status: 'ATTEMPT_FAILED',
+        stderrTail: `${tool}: ${stderrTail}`.slice(-4000),
+      });
+      return { kind: 'ATTEMPT_FAILED', tool, error: stderrTail };
+    }
+
+    const merged = mergeSarif([gitleaksDoc, semgrepDoc]);
+    const counts = countFindings(merged);
+    const toolBreakdown = {
+      gitleaks: countFindings(gitleaksDoc),
+      semgrep: countFindings(semgrepDoc),
+    };
+
+    // merged SARIF is a first-class artifact with the same integrity rules
+    const artifactId = randomUUID();
+    const dir = path.join(this.artifactsRoot, missionId);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `${artifactId}.sarif`);
+    const body = JSON.stringify(merged, null, 2);
+    await writeFile(filePath, body);
+    await insertArtifact(this.pool, {
+      id: artifactId,
+      missionId,
+      type: 'sarif',
+      path: filePath,
+      sha256: createHash('sha256').update(body).digest('hex'),
+      stats: { ...counts },
+    });
+
+    const passed = verdict(counts, failLevel) === 'pass';
+    await insertScanAttempt(this.pool, {
+      missionId,
+      status: passed ? 'PASSED' : 'FAILED',
+      counts,
+      toolBreakdown,
+      sarifArtifactId: artifactId,
+    });
+    // mission_events carry only the artifact id + counts (pin 5)
+    await appendEvent(
+      this.pool,
+      missionId,
+      passed ? 'SCAN_PASSED' : 'SCAN_FAILED',
+      { sarifArtifactId: artifactId, counts },
+    );
+
+    return passed
+      ? { kind: 'PASSED', sarifArtifactId: artifactId, counts }
+      : { kind: 'FAILED', sarifArtifactId: artifactId, counts };
+  }
+
+  /**
+   * Findings summary of the latest failed scan — embedded in the next build
+   * attempt's coder prompt (pin 3, M2/M3 prompt-feedback precedent).
+   */
+  private async lastScanFailureFindings(missionId: string): Promise<string | null> {
+    const events = await getMissionEvents(this.pool, missionId);
+    const lastScanFailed = [...events].reverse().find((e) => e.type === 'SCAN_FAILED');
+    if (!lastScanFailed) return null;
+    // only relevant if no successful scan happened after it
+    const lastScanPassed = [...events].reverse().find((e) => e.type === 'SCAN_PASSED');
+    if (lastScanPassed && lastScanPassed.seq > lastScanFailed.seq) return null;
+
+    const artifactId = lastScanFailed.payload.sarifArtifactId as string | undefined;
+    if (!artifactId) return null;
+    const artifact = await getArtifact(this.pool, artifactId);
+    if (!artifact) return null;
+    try {
+      const doc = JSON.parse(await readFile(artifact.path, 'utf8')) as SarifDocument;
+      const findings = listFindings(doc).slice(0, 20);
+      const lines = findings.map(
+        (f) =>
+          `- [${f.level}] ${f.tool} ${f.ruleId} at ${f.file ?? '?'}:${f.line ?? '?'} — ${f.message.slice(0, 200)}`,
+      );
+      return lines.join('\n');
+    } catch {
+      const counts = lastScanFailed.payload.counts as Record<string, number>;
+      return `security scan failed with ${counts?.errors ?? '?'} error-level finding(s); the SARIF report is unavailable`;
+    }
   }
 
   private async approvedPlan(missionId: string): Promise<Plan> {

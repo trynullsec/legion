@@ -13,7 +13,8 @@ export interface ArtifactRecord {
   type: string;
   path: string;
   sha256: string;
-  stats: ArtifactStats;
+  /** Diff artifacts: ArtifactStats; SARIF artifacts: {errors, warnings, notes}. */
+  stats: Record<string, number>;
   /** ISO 8601 UTC, microsecond precision text (M0 convention). */
   createdAt: string;
 }
@@ -24,7 +25,7 @@ interface ArtifactRow {
   type: string;
   path: string;
   sha256: string;
-  stats: ArtifactStats;
+  stats: Record<string, number>;
   created_at: string;
 }
 
@@ -52,7 +53,7 @@ export async function insertArtifact(
     type: string;
     path: string;
     sha256: string;
-    stats: ArtifactStats;
+    stats: Record<string, number>;
   },
 ): Promise<ArtifactRecord> {
   const { rows } = await pool.query<ArtifactRow>(

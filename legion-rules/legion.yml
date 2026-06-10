@@ -1,0 +1,14 @@
+rules:
+  # Deterministic warning-level rule used by Legion's tests (T36) and as a
+  # house rule. This is Legion source, not a fork of any scanner.
+  - id: legion-insecure-md5
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >-
+      Use of MD5 detected. MD5 is cryptographically broken; use SHA-256 or
+      a purpose-built password hash instead.
+    metadata:
+      category: security
+      legion: true
+    patterns:
+      - pattern-regex: (?i)\bmd5\b
