@@ -11,6 +11,8 @@ export {
   RISK_LEVELS,
   TERMINAL_STATES,
 } from './types.js';
+export { PlanRiskSchema, PlanSchema, PlanStepSchema } from './plan.js';
+export type { Plan, PlanRisk, PlanStep } from './plan.js';
 export type {
   EventType,
   FoldEvent,

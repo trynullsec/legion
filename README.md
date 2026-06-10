@@ -37,6 +37,7 @@ apps/board        React 18 + Vite — the Mission Board UI
 packages/core     pure mission domain logic (state machine), zero IO
 packages/db       Postgres access, raw SQL migrations (no ORM)
 packages/runtime  Hermes worker supervisor (M1)
+packages/orchestrator  planning flow: clone, prompt, validate, emit (M2)
 vendor/hermes-agent  vendored NousResearch/hermes-agent, pinned @ v2026.6.5
 ```
 
@@ -130,11 +131,57 @@ worker spawns on `gpt-oss-120b`, each 1–3 model calls on a trivial task
 (~15k input / ~1k output tokens) ≈ **$0.005 total**; budget $0.05 for
 headroom.
 
+## Planning loop (Milestone 2)
+
+A planner agent reads a real repository, produces a structured plan, and the
+plan flows through the mission state machine's approval gate.
+
+- **Plan contract.** `Plan` is a zod schema in `packages/core`: a one-paragraph
+  `summary`, ≥1 `steps` (each with `n`, `title`, `detail`,
+  `filesLikelyTouched`), `risks` with low/medium/high severity,
+  `openQuestions`, and an `estimatedComplexity` of
+  trivial/small/medium/large. The planner is instructed to write `plan.json`
+  (schema embedded in its task prompt) at its workdir root.
+- **Isolation.** The planner never touches the user's repository. The
+  orchestrator (`packages/orchestrator`) runs
+  `git clone --depth 1 file://<repoPath>` into the worker's isolated workdir
+  and the planner works on the clone. No git credentials, no remote access.
+- **Outcome handling.** On `WORKER_EXITED(0)` the orchestrator validates
+  `plan.json` against the schema. Valid → `PLAN_PROPOSED {plan}` lands on
+  `mission_events` (state → AWAITING_PLAN_APPROVAL). Missing/invalid →
+  the attempt failed: the mission stays PLANNING and the zod issues are
+  recorded in `worker_events` as `PLAN_INVALID`; no mission event. Crashes
+  and timeouts likewise leave the mission in PLANNING.
+- **Prompt-feedback loop on rejection.** `PLAN_REJECTED {reason}` returns the
+  mission to PLANNING. The next attempt's prompt embeds the prior plan's
+  summary and the rejection reason ("previous plan was rejected because: …").
+  Every prompt is recorded verbatim in `worker_events` as `WORKER_TASK`, so
+  the loop is auditable and testable.
+- **Concurrency guard.** One live planner per mission — a second
+  `POST /plan` while one is running returns 409.
+- **Model.** The planner uses the M1 default (`openai/gpt-oss-120b`);
+  override per role with the `LEGION_MODEL_PLANNER` env var (no UI).
+
+### Planning API
+
+```
+POST /api/missions/:id/plan          → start attempt (202; 409 unless DRAFT/PLANNING)
+POST /api/missions/:id/plan/approve  → PLAN_APPROVED (→ BUILDING; 409 otherwise)
+POST /api/missions/:id/plan/reject   {reason} → PLAN_REJECTED (→ PLANNING)
+```
+
+### Updated cost estimate per full test run
+
+M1 worker tests ≈ $0.005 (five trivial spawns). M2 adds two full planner
+runs (repo inspection, ~10–15 model calls each ≈ $0.01 apiece) plus three
+short-lived spawns ≈ **$0.03 total per `pnpm test`**; budget $0.10 for
+headroom.
+
 ## Tests
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop |
+| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip |
-| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation |
+| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop (real planner, real repo clone, approval gate, rejection feedback, concurrency guard) |
+| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

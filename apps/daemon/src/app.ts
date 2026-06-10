@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import {
   EVENT_TYPES,
@@ -20,6 +20,11 @@ import {
   WorkerNotRunningError,
   type WorkerSupervisor,
 } from '@legion/runtime';
+import {
+  PlanningInProgressError,
+  PlanningStateError,
+  type Orchestrator,
+} from '@legion/orchestrator';
 import type { Pool } from 'pg';
 
 const createMissionSchema = z.object({
@@ -43,6 +48,10 @@ const spawnWorkerSchema = z.object({
 
 const stopWorkerSchema = z.object({
   graceful: z.boolean(),
+});
+
+const rejectPlanSchema = z.object({
+  reason: z.string().min(1),
 });
 
 // Timestamps arrive from @legion/db as microsecond-precision UTC strings and
@@ -73,7 +82,11 @@ function serializeEvent(e: StoredEvent) {
   };
 }
 
-export function createApp(pool: Pool, supervisor?: WorkerSupervisor): Hono {
+export function createApp(
+  pool: Pool,
+  supervisor?: WorkerSupervisor,
+  orchestrator?: Orchestrator,
+): Hono {
   const app = new Hono();
 
   app.post('/api/missions', async (c) => {
@@ -170,6 +183,83 @@ export function createApp(pool: Pool, supervisor?: WorkerSupervisor): Hono {
       return c.json({ error: 'NOT_FOUND' }, 404);
     }
     return c.json({ missionId, asOf: raw, state });
+  });
+
+  // ---------- M2: planning loop ----------
+
+  const requireOrchestrator = () => {
+    if (!orchestrator) throw new Error('orchestrator is not configured');
+    return orchestrator;
+  };
+
+  app.post('/api/missions/:id/plan', async (c) => {
+    const orch = requireOrchestrator();
+    const missionId = c.req.param('id');
+    try {
+      const { workerId, settled } = await orch.startPlanning(missionId);
+      // process the attempt in the background; outcomes land in the event logs
+      void settled.catch((e) =>
+        console.error(`planning attempt for ${missionId} failed:`, e),
+      );
+      return c.json({ workerId }, 202);
+    } catch (e) {
+      if (e instanceof MissionNotFoundError) {
+        return c.json({ error: 'NOT_FOUND' }, 404);
+      }
+      if (e instanceof PlanningStateError) {
+        return c.json(
+          { error: 'INVALID_STATE', missionId: e.missionId, state: e.state },
+          409,
+        );
+      }
+      if (e instanceof PlanningInProgressError) {
+        return c.json(
+          { error: 'PLANNING_IN_PROGRESS', workerId: e.workerId },
+          409,
+        );
+      }
+      throw e;
+    }
+  });
+
+  const planDecision = async (
+    c: Context,
+    type: 'PLAN_APPROVED' | 'PLAN_REJECTED',
+    payload: Record<string, unknown>,
+  ) => {
+    const missionId = c.req.param('id') ?? '';
+    try {
+      const mission = await appendEvent(pool, missionId, type, payload);
+      return c.json({ mission: serializeMission(mission) });
+    } catch (e) {
+      if (e instanceof IllegalTransitionError) {
+        return c.json(
+          {
+            error: 'ILLEGAL_TRANSITION',
+            missionId: e.missionId,
+            from: e.from,
+            event: e.event,
+          },
+          409,
+        );
+      }
+      if (e instanceof MissionNotFoundError) {
+        return c.json({ error: 'NOT_FOUND' }, 404);
+      }
+      throw e;
+    }
+  };
+
+  app.post('/api/missions/:id/plan/approve', (c) =>
+    planDecision(c, 'PLAN_APPROVED', {}),
+  );
+
+  app.post('/api/missions/:id/plan/reject', async (c) => {
+    const parsed = rejectPlanSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    return planDecision(c, 'PLAN_REJECTED', { reason: parsed.data.reason });
   });
 
   // ---------- M1: worker runtime ----------

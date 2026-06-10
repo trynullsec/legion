@@ -51,6 +51,9 @@ importers:
       '@legion/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@legion/orchestrator':
+        specifier: workspace:*
+        version: link:../../packages/orchestrator
       '@legion/runtime':
         specifier: workspace:*
         version: link:../../packages/runtime
@@ -78,6 +81,10 @@ importers:
         version: 3.2.6(@types/node@25.9.2)(tsx@4.22.4)
 
   packages/core:
+    dependencies:
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       typescript:
         specifier: ^5.7.2
@@ -110,6 +117,28 @@ importers:
       vitest:
         specifier: ^3.0.5
         version: 3.2.6(@types/node@25.9.2)(tsx@4.22.4)
+
+  packages/orchestrator:
+    dependencies:
+      '@legion/core':
+        specifier: workspace:*
+        version: link:../core
+      '@legion/db':
+        specifier: workspace:*
+        version: link:../db
+      '@legion/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      pg:
+        specifier: ^8.13.1
+        version: 8.21.0
+    devDependencies:
+      '@types/pg':
+        specifier: ^8.11.10
+        version: 8.20.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
 
   packages/runtime:
     dependencies:

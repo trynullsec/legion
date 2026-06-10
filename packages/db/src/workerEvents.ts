@@ -13,6 +13,8 @@ export type WorkerStatus = (typeof WORKER_STATUSES)[number];
 export const WORKER_EVENT_TYPES = [
   'WORKER_CREATED',
   'WORKER_STARTED',
+  'WORKER_TASK',
+  'PLAN_INVALID',
   'MODEL_MESSAGE',
   'TOOL_CALL',
   'TOOL_RESULT',

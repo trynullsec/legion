@@ -271,6 +271,22 @@ describe('T16: graceful stop — SIGTERM first, SIGKILL only at the deadline', (
 
     try {
       await waitForToolCall(workerId, 90_000);
+      // TOOL_CALL fires before the subprocess exists — wait until the
+      // TERM-resistant shell is genuinely alive, or the scenario is void.
+      const resistantAlive = async (): Promise<boolean> =>
+        new Promise((resolve) => {
+          const p = spawn('pgrep', ['-f', 'trap "" TERM; sleep 600']);
+          p.on('exit', (code) => resolve(code === 0));
+          p.on('error', () => resolve(false));
+        });
+      const spawnDeadline = Date.now() + 30_000;
+      while (!(await resistantAlive())) {
+        if (Date.now() > spawnDeadline) {
+          throw new Error('resistant shell never spawned');
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
       const running = await supervisor.getWorker(workerId);
       const pid = running!.pid!;
       const groupBefore = await groupPids(pid);

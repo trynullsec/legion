@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  approvePlan,
   fetchMission,
   fetchMissions,
   fetchWorkerEvents,
   fetchWorkers,
   postMission,
+  rejectPlan,
+  startPlanning,
   type Mission,
   type MissionEvent,
   type MissionState,
+  type Plan,
   type RiskLevel,
   type Worker,
   type WorkerEvent,
@@ -96,6 +100,140 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
       </button>
       {error && <p className="error">{error}</p>}
     </form>
+  );
+}
+
+function PlanSection({
+  mission,
+  events,
+  onChanged,
+}: {
+  mission: Mission;
+  events: MissionEvent[];
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [reason, setReason] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const act = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const proposed = [...events]
+    .reverse()
+    .find((e) => e.type === 'PLAN_PROPOSED');
+  const plan = proposed
+    ? ((proposed.payload as { plan?: Plan }).plan ?? null)
+    : null;
+
+  const canPlan = mission.state === 'DRAFT' || mission.state === 'PLANNING';
+  const awaiting = mission.state === 'AWAITING_PLAN_APPROVAL';
+  if (!canPlan && !awaiting && !plan) return null;
+
+  return (
+    <section className="plan">
+      <h3>Plan</h3>
+      {error && <p className="error">{error}</p>}
+
+      {canPlan && (
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={() => void act(() => startPlanning(mission.missionId))}
+        >
+          {busy ? 'Working…' : 'Start planning'}
+        </button>
+      )}
+
+      {plan && (
+        <div className="plan-body">
+          <p className="plan-summary">{plan.summary}</p>
+          <p className="mono plan-meta">
+            complexity: {plan.estimatedComplexity}
+          </p>
+
+          <h4 className="mono">Steps</h4>
+          <ol className="plan-steps">
+            {plan.steps.map((s) => (
+              <li key={s.n}>
+                <strong>{s.title}</strong> — {s.detail}
+                {s.filesLikelyTouched.length > 0 && (
+                  <span className="mono files">
+                    {' '}
+                    [{s.filesLikelyTouched.join(', ')}]
+                  </span>
+                )}
+              </li>
+            ))}
+          </ol>
+
+          {plan.risks.length > 0 && (
+            <>
+              <h4 className="mono">Risks</h4>
+              <ul className="plan-risks">
+                {plan.risks.map((r, i) => (
+                  <li key={i}>
+                    <span className={`mono badge badge-${r.severity}`}>
+                      {r.severity}
+                    </span>{' '}
+                    {r.description}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {plan.openQuestions.length > 0 && (
+            <>
+              <h4 className="mono">Open questions</h4>
+              <ul>
+                {plan.openQuestions.map((q, i) => (
+                  <li key={i}>{q}</li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {awaiting && (
+            <div className="plan-actions">
+              <button
+                className="primary"
+                disabled={busy}
+                onClick={() => void act(() => approvePlan(mission.missionId))}
+              >
+                Approve plan
+              </button>
+              <input
+                placeholder="rejection reason"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+              />
+              <button
+                disabled={busy || reason.trim().length === 0}
+                onClick={() =>
+                  void act(async () => {
+                    await rejectPlan(mission.missionId, reason.trim());
+                    setReason('');
+                  })
+                }
+              >
+                Reject
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -240,6 +378,11 @@ function MissionDetail({
               </li>
             ))}
           </ol>
+          <PlanSection
+            mission={mission}
+            events={events}
+            onChanged={() => void load()}
+          />
           <WorkersSection missionId={missionId} />
         </>
       )}

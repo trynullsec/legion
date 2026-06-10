@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { createPool } from '@legion/db';
+import { Orchestrator } from '@legion/orchestrator';
 import { WorkerSupervisor } from '@legion/runtime';
 import { createApp } from './app.js';
 
@@ -10,6 +11,7 @@ const PORT = 4242;
 
 const pool = createPool();
 const supervisor = new WorkerSupervisor({ pool });
+const orchestrator = new Orchestrator({ pool, supervisor });
 
 // Daemon restart with workers running: mark orphaned RUNNING workers FAILED.
 const orphaned = await supervisor.reconcileOrphans();
@@ -17,7 +19,7 @@ if (orphaned.length > 0) {
   console.log(`reconciled ${orphaned.length} orphaned worker(s):`, orphaned);
 }
 
-const app = createApp(pool, supervisor);
+const app = createApp(pool, supervisor, orchestrator);
 
 // Serve the built Mission Board (apps/board/dist) for everything non-API.
 const boardDist = path.relative(

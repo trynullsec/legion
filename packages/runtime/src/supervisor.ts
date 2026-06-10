@@ -38,6 +38,8 @@ export interface StartWorkerInput {
   workdir?: string;
   /** Overrides the configured hard timeout for this worker. */
   timeoutMs?: number;
+  /** Per-role model override (additive; defaults to the configured model). */
+  model?: string;
 }
 
 interface LiveWorker {
@@ -118,11 +120,12 @@ export class WorkerSupervisor {
     const tmpdir = path.join(workdir, '.tmp');
     await mkdir(tmpdir, { recursive: true });
 
+    const model = input.model ?? this.config.model;
     await this.append(input.missionId, workerId, 'WORKER_CREATED', {
       role: input.role,
       task: input.task,
       workdir,
-      model: this.config.model,
+      model,
     });
 
     // Minimal env allowlist. The parent environment is NOT inherited:
@@ -135,7 +138,7 @@ export class WorkerSupervisor {
       PYTHONUNBUFFERED: '1',
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY ?? '',
       LEGION_TASK: input.task,
-      LEGION_MODEL: this.config.model,
+      LEGION_MODEL: model,
       LEGION_BASE_URL: this.config.baseUrl,
       LEGION_MAX_TURNS: String(this.config.maxTurns),
     };

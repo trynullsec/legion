@@ -237,6 +237,113 @@ header .sub {
   overflow-x: auto;
 }
 
+/* ---------- plan ---------- */
+.plan {
+  margin-top: 32px;
+}
+
+.plan h3,
+.plan h4 {
+  font-family: ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+
+.plan h3 {
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.plan h4 {
+  font-size: 11px;
+  margin: 16px 0 8px;
+}
+
+.plan .primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 10px 18px;
+  font: 12px ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.plan button:disabled {
+  opacity: 0.6;
+}
+
+.plan-body {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  padding: 16px;
+  margin-top: 12px;
+  max-width: 90ch;
+}
+
+.plan-summary {
+  margin-bottom: 8px;
+}
+
+.plan-meta {
+  color: #666;
+}
+
+.plan-steps li,
+.plan-risks li {
+  margin: 6px 0 6px 18px;
+}
+
+.plan .files {
+  color: #666;
+  text-transform: none;
+}
+
+.badge {
+  padding: 1px 8px;
+  border: 1px solid currentColor;
+  border-radius: 10px;
+}
+
+.badge-low {
+  color: #0a7d33;
+}
+
+.badge-medium {
+  color: #9a6700;
+}
+
+.badge-high {
+  color: #b00020;
+}
+
+.plan-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 16px;
+}
+
+.plan-actions input {
+  flex: 1;
+  font: 13px ui-monospace, monospace;
+  padding: 8px;
+  border: 1px solid var(--line);
+}
+
+.plan-actions button {
+  border: 1px solid #b00020;
+  color: #b00020;
+  background: none;
+  padding: 9px 14px;
+  font: 12px ui-monospace, monospace;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
 /* ---------- workers ---------- */
 .workers {
   margin-top: 32px;

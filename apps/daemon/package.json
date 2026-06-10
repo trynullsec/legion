@@ -13,6 +13,7 @@
     "@hono/node-server": "^1.13.7",
     "@legion/core": "workspace:*",
     "@legion/db": "workspace:*",
+    "@legion/orchestrator": "workspace:*",
     "@legion/runtime": "workspace:*",
     "hono": "^4.6.16",
     "pg": "^8.13.1",

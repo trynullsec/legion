@@ -109,6 +109,46 @@ export async function fetchWorkerEvents(
   return data.events;
 }
 
+export interface PlanStep {
+  n: number;
+  title: string;
+  detail: string;
+  filesLikelyTouched: string[];
+}
+
+export interface Plan {
+  summary: string;
+  steps: PlanStep[];
+  risks: { description: string; severity: 'low' | 'medium' | 'high' }[];
+  openQuestions: string[];
+  estimatedComplexity: 'trivial' | 'small' | 'medium' | 'large';
+}
+
+export async function startPlanning(missionId: string): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/plan`, { method: 'POST' }),
+  );
+}
+
+export async function approvePlan(missionId: string): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/plan/approve`, { method: 'POST' }),
+  );
+}
+
+export async function rejectPlan(
+  missionId: string,
+  reason: string,
+): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/plan/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+
 export async function postMission(input: NewMission): Promise<Mission> {
   const data = await asJson<{ mission: Mission }>(
     await fetch('/api/missions', {
