@@ -1,0 +1,121 @@
+export type MissionState =
+  | 'DRAFT'
+  | 'PLANNING'
+  | 'AWAITING_PLAN_APPROVAL'
+  | 'BUILDING'
+  | 'SCANNING'
+  | 'AWAITING_MERGE_APPROVAL'
+  | 'MERGED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export type RiskLevel = 'low' | 'medium' | 'high';
+
+export interface Mission {
+  missionId: string;
+  state: MissionState;
+  title: string;
+  objective: string;
+  repoPath: string;
+  riskLevel: RiskLevel;
+  createdAt: string;
+  updatedAt: string;
+  eventCount: number;
+}
+
+export interface MissionEvent {
+  id: string;
+  missionId: string;
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+  validFrom: string;
+  recordedAt: string;
+}
+
+export interface NewMission {
+  title: string;
+  objective: string;
+  repoPath: string;
+  riskLevel: RiskLevel;
+}
+
+async function asJson<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${res.status}: ${body}`);
+  }
+  return (await res.json()) as T;
+}
+
+export async function fetchMissions(): Promise<Mission[]> {
+  const data = await asJson<{ missions: Mission[] }>(
+    await fetch('/api/missions'),
+  );
+  return data.missions;
+}
+
+export async function fetchMission(
+  id: string,
+): Promise<{ mission: Mission; events: MissionEvent[] }> {
+  return asJson(await fetch(`/api/missions/${id}`));
+}
+
+export type WorkerStatus =
+  | 'STARTING'
+  | 'RUNNING'
+  | 'EXITED'
+  | 'KILLED'
+  | 'FAILED';
+
+export interface Worker {
+  workerId: string;
+  missionId: string;
+  role: string;
+  task: string;
+  workdir: string;
+  pid: number | null;
+  status: WorkerStatus;
+  reason: string | null;
+  exitCode: number | null;
+  createdAt: string;
+  updatedAt: string;
+  eventCount: number;
+}
+
+export interface WorkerEvent {
+  id: string;
+  missionId: string;
+  workerId: string;
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+  recordedAt: string;
+}
+
+export async function fetchWorkers(missionId: string): Promise<Worker[]> {
+  const data = await asJson<{ workers: Worker[] }>(
+    await fetch(`/api/missions/${missionId}/workers`),
+  );
+  return data.workers;
+}
+
+export async function fetchWorkerEvents(
+  workerId: string,
+): Promise<WorkerEvent[]> {
+  const res = await fetch(`/api/workers/${workerId}/events`);
+  if (res.status === 404) return [];
+  const data = await asJson<{ events: WorkerEvent[] }>(res);
+  return data.events;
+}
+
+export async function postMission(input: NewMission): Promise<Mission> {
+  const data = await asJson<{ mission: Mission }>(
+    await fetch('/api/missions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+  );
+  return data.mission;
+}
