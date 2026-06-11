@@ -201,9 +201,22 @@ describe('T31: scan failure routes back to BUILDING (M4 amendment)', () => {
   });
 });
 
-describe('merge rejection terminates in FAILED', () => {
-  it('MERGE_REJECTED folds to FAILED', () => {
-    const events: FoldEvent[] = [
+describe('T44: merge rejection routes back to BUILDING (M5 amendment)', () => {
+  it('AWAITING_MERGE_APPROVAL -MERGE_REJECTED-> BUILDING is encoded in the table', () => {
+    expect(TRANSITIONS.AWAITING_MERGE_APPROVAL.MERGE_REJECTED).toBe('BUILDING');
+  });
+
+  it('only MISSION_FAILED terminates from AWAITING_MERGE_APPROVAL', () => {
+    const gate = TRANSITIONS.AWAITING_MERGE_APPROVAL;
+    const toFailed = Object.entries(gate)
+      .filter(([, to]) => to === 'FAILED')
+      .map(([event]) => event);
+    expect(toFailed).toEqual(['MISSION_FAILED']);
+    expect(gate.MISSION_CANCELLED).toBe('CANCELLED');
+  });
+
+  it('MERGE_REJECTED folds to BUILDING, and the rework loop completes to MERGED', () => {
+    const reworked: FoldEvent[] = [
       created(),
       ev('PLANNING_STARTED'),
       ev('PLAN_PROPOSED'),
@@ -214,6 +227,16 @@ describe('merge rejection terminates in FAILED', () => {
       ev('SCAN_PASSED'),
       ev('MERGE_REJECTED'),
     ];
-    expect(foldMission(MISSION_ID, events).state).toBe('FAILED');
+    expect(foldMission(MISSION_ID, reworked).state).toBe('BUILDING');
+
+    const completed: FoldEvent[] = [
+      ...reworked,
+      ev('BUILD_STARTED'),
+      ev('BUILD_COMPLETED'),
+      ev('SCAN_STARTED'),
+      ev('SCAN_PASSED'),
+      ev('MERGE_APPROVED'),
+    ];
+    expect(foldMission(MISSION_ID, completed).state).toBe('MERGED');
   });
 });

@@ -258,6 +258,61 @@ export function parseSarifFindings(content: string): ScanFinding[] {
   return findings;
 }
 
+export interface ApprovalInfo {
+  approvals: {
+    id: string;
+    decision: 'approve' | 'reject';
+    artifactSha256: string;
+    reason: string | null;
+    createdAt: string;
+  }[];
+  hashes: { diff: string; sarif: string } | null;
+}
+
+export async function isApproverRegistered(): Promise<boolean> {
+  const data = await asJson<{ registered: boolean }>(
+    await fetch('/api/auth/approver'),
+  );
+  return data.registered;
+}
+
+export async function fetchApproval(missionId: string): Promise<ApprovalInfo> {
+  return asJson(await fetch(`/api/missions/${missionId}/approval`));
+}
+
+export async function approvalOptions(missionId: string): Promise<unknown> {
+  const data = await asJson<{ options: unknown }>(
+    await fetch(`/api/missions/${missionId}/approval/options`, { method: 'POST' }),
+  );
+  return data.options;
+}
+
+export async function submitApprove(
+  missionId: string,
+  response: unknown,
+): Promise<{ mergeCommit?: string; error?: string }> {
+  const res = await fetch(`/api/missions/${missionId}/approve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ response }),
+  });
+  return (await res.json()) as { mergeCommit?: string; error?: string };
+}
+
+export async function submitReject(
+  missionId: string,
+  response: unknown,
+  reason: string,
+): Promise<void> {
+  await asJson(
+    await fetch(`/api/missions/${missionId}/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ response, reason }),
+    }),
+  );
+}
+
 export async function postMission(input: NewMission): Promise<Mission> {
   const data = await asJson<{ mission: Mission }>(
     await fetch('/api/missions', {

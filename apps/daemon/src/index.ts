@@ -19,6 +19,13 @@ if (orphaned.length > 0) {
   console.log(`reconciled ${orphaned.length} orphaned worker(s):`, orphaned);
 }
 
+// Crash reconciliation (M5 pin 5d): emit MERGE_APPROVED for any merge commit
+// that exists in a user repo while the mission never recorded the event.
+const reconciledMerges = await orchestrator.reconcileMerges();
+if (reconciledMerges.length > 0) {
+  console.log(`reconciled ${reconciledMerges.length} merge(s):`, reconciledMerges);
+}
+
 const app = createApp(pool, supervisor, orchestrator);
 
 // Serve the built Mission Board (apps/board/dist) for everything non-API.

@@ -31,3 +31,20 @@ export { getArtifact, insertArtifact, listArtifacts } from './artifacts.js';
 export type { ArtifactRecord, ArtifactStats } from './artifacts.js';
 export { insertScanAttempt, latestScanAttempt } from './scanAttempts.js';
 export type { ScanAttemptRecord, ScanStatus } from './scanAttempts.js';
+export {
+  claimChallenge,
+  countApprovers,
+  getApproval,
+  getApproverByCredentialId,
+  getChallenge,
+  insertApproval,
+  insertApprover,
+  insertChallenge,
+  listApprovals,
+  updateApproverCounter,
+} from './approvals.js';
+export type {
+  ApprovalChallengeRecord,
+  ApprovalRecord,
+  ApproverRecord,
+} from './approvals.js';

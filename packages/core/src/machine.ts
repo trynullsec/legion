@@ -74,7 +74,9 @@ export const TRANSITIONS: Record<
   },
   AWAITING_MERGE_APPROVAL: {
     MERGE_APPROVED: 'MERGED',
-    MERGE_REJECTED: 'FAILED',
+    // M5 amendment: a signed rejection routes back to BUILDING for rework;
+    // MISSION_FAILED / MISSION_CANCELLED are the only terminal routes.
+    MERGE_REJECTED: 'BUILDING',
     MISSION_FAILED: 'FAILED',
     MISSION_CANCELLED: 'CANCELLED',
   },

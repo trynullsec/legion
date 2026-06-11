@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  startAuthentication,
+  startRegistration,
+} from '@simplewebauthn/browser';
+import {
+  approvalOptions,
+  fetchApproval,
+  isApproverRegistered,
+  submitApprove,
+  submitReject,
+  type ApprovalInfo,
+} from './api';
+import {
   approvePlan,
   fetchArtifactContent,
   fetchArtifacts,
@@ -370,6 +382,148 @@ function BuildSection({ mission }: { mission: Mission }) {
   );
 }
 
+function MergedBanner({ missionId }: { missionId: string }) {
+  const [commit, setCommit] = useState<string | null>(null);
+  useEffect(() => {
+    void fetchMission(missionId).then((d) => {
+      const merged = [...d.events].reverse().find((e) => e.type === 'MERGE_APPROVED');
+      const mc = merged?.payload?.mergeCommit;
+      setCommit(typeof mc === 'string' ? mc : null);
+    });
+  }, [missionId]);
+  return (
+    <section className="approval">
+      <h3>Merged</h3>
+      <div className="approval-box">
+        <p className="mono small">
+          this mission was approved with a passkey and merged into the
+          repository.
+        </p>
+        {commit && <p className="mono small">merge commit: {commit}</p>}
+      </div>
+    </section>
+  );
+}
+
+function ApprovalPanel({ mission }: { mission: Mission }) {
+  const [registered, setRegistered] = useState<boolean | null>(null);
+  const [info, setInfo] = useState<ApprovalInfo | null>(null);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setRegistered(await isApproverRegistered());
+      setInfo(await fetchApproval(mission.missionId));
+    } catch {
+      /* approval API optional in dev */
+    }
+  }, [mission.missionId]);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), POLL_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  if (mission.state !== 'AWAITING_MERGE_APPROVAL') return null;
+
+  const registerApprover = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const optsRes = await fetch('/api/auth/approver/register-options', { method: 'POST' });
+      const { options } = await optsRes.json();
+      const attestation = await startRegistration({ optionsJSON: options });
+      const res = await fetch('/api/auth/approver/register', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ response: attestation }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runCeremony = async (decision: 'approve' | 'reject') => {
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const options = await approvalOptions(mission.missionId);
+      const assertion = await startAuthentication({ optionsJSON: options as never });
+      if (decision === 'approve') {
+        const r = await submitApprove(mission.missionId, assertion);
+        if (r.error) setError(r.error);
+        else setStatus(`merged: ${r.mergeCommit?.slice(0, 10)}`);
+      } else {
+        await submitReject(mission.missionId, assertion, reason.trim());
+        setStatus('rejected — routed back to building');
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="approval">
+      <h3>Human Gate — Merge Approval</h3>
+      {error && <p className="error">{error}</p>}
+      {status && <p className="mono small route-note">{status}</p>}
+
+      {registered === false && (
+        <div className="approval-box">
+          <p className="mono small">No approver registered on this device.</p>
+          <button className="primary" disabled={busy} onClick={() => void registerApprover()}>
+            {busy ? 'Working…' : 'Register approver (passkey)'}
+          </button>
+        </div>
+      )}
+
+      {registered && (
+        <div className="approval-box">
+          {info?.hashes && (
+            <p className="mono small">
+              bound artifacts<br />
+              diff sha256: {info.hashes.diff}<br />
+              sarif sha256: {info.hashes.sarif}
+            </p>
+          )}
+          <div className="plan-actions">
+            <button className="primary" disabled={busy} onClick={() => void runCeremony('approve')}>
+              Approve with passkey
+            </button>
+            <input
+              placeholder="rejection reason"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+            />
+            <button
+              disabled={busy || reason.trim().length === 0}
+              onClick={() => void runCeremony('reject')}
+            >
+              Reject…
+            </button>
+          </div>
+          <p className="mono small">
+            an approval is a passkey signature bound to the exact bytes above —
+            tamper voids it
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ScanSection({ mission }: { mission: Mission }) {
   const [scan, setScan] = useState<ScanInfo | null>(null);
   const [findings, setFindings] = useState<ScanFinding[] | null>(null);
@@ -656,6 +810,10 @@ function MissionDetail({
           />
           <BuildSection mission={mission} />
           <ScanSection mission={mission} />
+          <ApprovalPanel mission={mission} />
+          {mission.state === 'MERGED' && (
+            <MergedBanner missionId={mission.missionId} />
+          )}
           <WorkersSection missionId={missionId} />
         </>
       )}

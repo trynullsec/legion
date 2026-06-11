@@ -22,3 +22,5 @@ export {
   buildRevisionPrompt,
 } from './prompt.js';
 export type { RejectionFeedback } from './prompt.js';
+export { executeMerge, reconcileMerges } from './merge.js';
+export type { MergeOutcome } from './merge.js';

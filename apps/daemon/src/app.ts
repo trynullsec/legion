@@ -34,6 +34,15 @@ import {
 } from '@legion/orchestrator';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { countApprovers, listApprovals } from '@legion/db';
+import {
+  buildApprovalOptions,
+  buildRegistrationOptions,
+  IntegrityError,
+  recomputeBoundHashes,
+  verifyCeremony,
+  verifyRegistration,
+} from './approval.js';
 import type { Pool } from 'pg';
 
 // Every HTTP boundary schema is strict: unknown keys (e.g. smuggled internal
@@ -71,6 +80,26 @@ const stopWorkerSchema = z
 
 const rejectPlanSchema = z
   .object({
+    reason: z.string().min(1),
+  })
+  .strict();
+
+const registerSchema = z
+  .object({
+    response: z.record(z.unknown()),
+    label: z.string().min(1).optional(),
+  })
+  .strict();
+
+const approveSchema = z
+  .object({
+    response: z.record(z.unknown()),
+  })
+  .strict();
+
+const rejectMergeSchema = z
+  .object({
+    response: z.record(z.unknown()),
     reason: z.string().min(1),
   })
   .strict();
@@ -334,6 +363,169 @@ export function createApp(
       }
       throw e;
     }
+  });
+
+  // ---------- M5: human gate (WebAuthn approval + merge) ----------
+
+  // single-process daemon, single approver: the registration challenge lives
+  // only between the options call and its verify (a one-time setup ceremony)
+  let pendingRegistrationChallenge: string | null = null;
+
+  app.get('/api/auth/approver', async (c) => {
+    const n = await countApprovers(pool);
+    return c.json({ registered: n > 0 });
+  });
+
+  app.post('/api/auth/approver/register-options', async (c) => {
+    const result = await buildRegistrationOptions(pool);
+    if (result.exists) {
+      return c.json({ error: 'APPROVER_EXISTS' }, 409);
+    }
+    pendingRegistrationChallenge = result.options.challenge;
+    return c.json({ options: result.options });
+  });
+
+  app.post('/api/auth/approver/register', async (c) => {
+    const parsed = registerSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    if (!pendingRegistrationChallenge) {
+      return c.json({ error: 'NO_PENDING_REGISTRATION' }, 409);
+    }
+    const challenge = pendingRegistrationChallenge;
+    pendingRegistrationChallenge = null;
+    const result = await verifyRegistration(
+      pool,
+      challenge,
+      parsed.data.response,
+      parsed.data.label ?? 'primary approver',
+    );
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+    return c.json({ registered: true }, 201);
+  });
+
+  app.post('/api/missions/:id/approval/options', async (c) => {
+    const missionId = c.req.param('id');
+    const result = await getMission(pool, missionId);
+    if (!result) return c.json({ error: 'NOT_FOUND' }, 404);
+    if (result.mission.state !== 'AWAITING_MERGE_APPROVAL') {
+      return c.json(
+        { error: 'INVALID_STATE', state: result.mission.state },
+        409,
+      );
+    }
+    try {
+      const { options, boundHashes } = await buildApprovalOptions(pool, missionId);
+      return c.json({ options, boundHashes });
+    } catch (e) {
+      if (e instanceof IntegrityError) {
+        return c.json({ error: 'INTEGRITY', message: e.message }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.post('/api/missions/:id/approve', async (c) => {
+    const orch = requireOrchestrator();
+    const parsed = approveSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    const missionId = c.req.param('id');
+    const mission = await getMission(pool, missionId);
+    if (!mission) return c.json({ error: 'NOT_FOUND' }, 404);
+    if (mission.mission.state !== 'AWAITING_MERGE_APPROVAL') {
+      return c.json({ error: 'INVALID_STATE', state: mission.mission.state }, 409);
+    }
+
+    const ceremony = await verifyCeremony(pool, missionId, 'approve', parsed.data.response, null);
+    if (!ceremony.ok) {
+      return c.json({ error: ceremony.error }, ceremony.status);
+    }
+
+    // verified approval recorded — now (and only now) execute the merge
+    const outcome = await orch.mergeMission(missionId, ceremony.approval.id);
+    if (outcome.kind === 'MERGED') {
+      return c.json({
+        merged: true,
+        approvalId: ceremony.approval.id,
+        mergeCommit: outcome.mergeCommit,
+      });
+    }
+    if (outcome.kind === 'BLOCKED_DIRTY') {
+      return c.json(
+        { error: 'MERGE_BLOCKED_DIRTY', approvalId: ceremony.approval.id },
+        409,
+      );
+    }
+    if (outcome.kind === 'CONFLICT') {
+      return c.json(
+        { error: 'MERGE_CONFLICT', approvalId: ceremony.approval.id },
+        409,
+      );
+    }
+    return c.json({ error: 'NO_WORKSPACE' }, 409);
+  });
+
+  app.post('/api/missions/:id/reject', async (c) => {
+    const parsed = rejectMergeSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    const missionId = c.req.param('id');
+    const mission = await getMission(pool, missionId);
+    if (!mission) return c.json({ error: 'NOT_FOUND' }, 404);
+    if (mission.mission.state !== 'AWAITING_MERGE_APPROVAL') {
+      return c.json({ error: 'INVALID_STATE', state: mission.mission.state }, 409);
+    }
+
+    const ceremony = await verifyCeremony(
+      pool,
+      missionId,
+      'reject',
+      parsed.data.response,
+      parsed.data.reason,
+    );
+    if (!ceremony.ok) {
+      return c.json({ error: ceremony.error }, ceremony.status);
+    }
+
+    const updated = await appendEvent(pool, missionId, 'MERGE_REJECTED', {
+      reason: parsed.data.reason,
+      approvalId: ceremony.approval.id,
+    });
+    return c.json({
+      mission: serializeMission(updated),
+      approvalId: ceremony.approval.id,
+    });
+  });
+
+  app.get('/api/missions/:id/approval', async (c) => {
+    const missionId = c.req.param('id');
+    const mission = await getMission(pool, missionId);
+    if (!mission) return c.json({ error: 'NOT_FOUND' }, 404);
+    const approvals = await listApprovals(pool, missionId);
+    let hashes: { diff: string; sarif: string } | null = null;
+    try {
+      const b = await recomputeBoundHashes(pool, missionId);
+      hashes = { diff: b.diff, sarif: b.sarif };
+    } catch {
+      hashes = null;
+    }
+    return c.json({
+      approvals: approvals.map((a) => ({
+        id: a.id,
+        decision: a.decision,
+        artifactSha256: a.artifactSha256,
+        credentialId: a.credentialId,
+        reason: a.reason,
+        createdAt: a.createdAt,
+      })),
+      hashes,
+    });
   });
 
   // ---------- M4: security scan stage ----------

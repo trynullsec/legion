@@ -41,6 +41,7 @@ packages/runtime  Hermes worker supervisor (M1)
 packages/orchestrator  planning + build + scan flows (M2–M4)
 packages/scanner  gitleaks + semgrep SARIF scan engine (M4)
 legion-rules      in-repo semgrep house rules (Legion source, M4)
+                  WebAuthn approval + merge execution live in orchestrator/daemon (M5)
 vendor/hermes-agent  vendored NousResearch/hermes-agent, pinned @ v2026.6.5
 ```
 
@@ -53,16 +54,18 @@ vendor/hermes-agent  vendored NousResearch/hermes-agent, pinned @ v2026.6.5
 DRAFT ──► PLANNING ──► AWAITING_PLAN_APPROVAL ──► BUILDING ──► SCANNING ──► AWAITING_MERGE_APPROVAL ──► MERGED
   │PLANNING_ │PLAN_PROPOSED   │PLAN_APPROVED   │BUILD_      │SCAN_PASSED   │MERGE_APPROVED
   │STARTED   │                │                │COMPLETED   │              │
-  │          │                │                │            │              │MERGE_REJECTED
-  │          │                │                │            │              ▼
+  │          │                │   MERGE_REJECTED (M5: rework) ┘            │
+  │          │                │                │            │              │
   └──────────┴────────────────┴── MISSION_FAILED / MISSION_CANCELLED ──► FAILED / CANCELLED
                                   (from any non-terminal state)
 ```
 
 `BUILD_STARTED` and `SCAN_STARTED` are self-transitions inside BUILDING and
 SCANNING. **M4 amendment**: `SCAN_FAILED` routes `SCANNING → BUILDING` for
-rework (no longer to FAILED); `MERGE_REJECTED` is the remaining `→ FAILED`
-route. Terminal states: MERGED, FAILED, CANCELLED.
+rework. **M5 amendment**: `MERGE_REJECTED` routes
+`AWAITING_MERGE_APPROVAL → BUILDING` for rework. After both amendments,
+`MISSION_FAILED`/`MISSION_CANCELLED` are the only terminal-failure routes.
+Terminal states: MERGED, FAILED, CANCELLED.
 
 ### Why event sourcing
 
@@ -294,12 +297,69 @@ budget $0.40 for headroom (planner/coder/reviewer retries under model load).
 First `pnpm test` after a fresh checkout also downloads gitleaks + the
 semgrep venv via `setup-scanners.sh` (no API cost).
 
+## The human gate (Milestone 5)
+
+A clean-scanned mission is approved with a passkey ceremony cryptographically
+bound to the exact artifact bytes — and only then does Legion merge into the
+user's repository. This is the launch milestone.
+
+- **WebAuthn**: `@simplewebauthn/server` (daemon) + `@simplewebauthn/browser`
+  (board). `localhost:4242` is a secure context; platform authenticator
+  (Touch ID) preferred, `rpID = localhost`. Single approver for v0.1.
+- **The binding rule (the heart of M5).** The approval challenge is
+  `base64url(sha256(missionId | diffArtifactSha256 | sarifArtifactSha256 |
+  serverNonce))`. The server recomputes both artifact hashes **from disk** at
+  challenge issue *and* again at verification; any mismatch (a byte changed
+  between review and click) → **409 INTEGRITY**, the challenge is voided, and
+  no merge happens. An approval therefore proves *which bytes* were approved,
+  not merely that someone clicked.
+- **Single-use + TTL.** Challenges are claimed atomically (`update … where
+  used_at is null and expires_at > now()`), so a replayed assertion 409s and
+  an expired one (2-minute TTL) 409s. A "no" is signed too: rejection runs the
+  same ceremony and is recorded in `approvals`.
+- **Merge execution** (only after a verified approval): preconditions checked
+  atomically — the user repo working tree must be clean (else
+  `MERGE_BLOCKED_DIRTY`, mission stays at the gate). Then
+  `git fetch <attemptWorkspace> <legionBranch>` + `git merge --no-ff` with
+  message `legion: <title> (M-<short>, approval <id>)`. A conflict aborts
+  cleanly (`git merge --abort`), the user repo is verified byte-identical, and
+  `MERGE_CONFLICT` is recorded (worker_events-style, not a mission event) while
+  the mission stays at the gate. On success — and only after the merge commit
+  exists — `MERGE_APPROVED {approvalId, artifactSha256s, mergeCommit}` is
+  emitted → MERGED. **Crash reconciliation**: on boot, if a merge commit
+  naming an approval exists but its mission isn't MERGED, the event is emitted
+  exactly once (idempotent).
+- **State amendment**: `MERGE_REJECTED` now routes
+  `AWAITING_MERGE_APPROVAL → BUILDING` (rework) carrying `{reason, approvalId}`;
+  the next build's coder prompt embeds the rejection reason.
+  `MISSION_FAILED`/`MISSION_CANCELLED` remain the only terminal-failure routes.
+
+### Approval API
+
+```
+POST /api/auth/approver/register-options   ┐ standard @simplewebauthn registration
+POST /api/auth/approver/register           ┘ pair; 409 if an approver exists
+POST /api/missions/:id/approval/options     → challenge bound to current artifacts; 409 unless AWAITING_MERGE_APPROVAL
+POST /api/missions/:id/approve              → verify ceremony, then merge; 401 bad signature, 409 reused/expired/integrity
+POST /api/missions/:id/reject  {reason}     → signed rejection → BUILDING
+```
+
+### Testing stance: real protocol, software key store
+
+The acceptance tests use an **in-repo software FIDO2 authenticator**
+(`apps/daemon/test/softkey.ts`): a **real ES256 keypair** with **real CBOR
+attestation/assertion construction**. The entire `@simplewebauthn` server
+verification path runs **unmodified** against it — genuine signatures, genuine
+verification. This is the pinned, honest exception to hardware: real protocol,
+software key store. **There are no verification bypass flags anywhere in the
+code, not even for tests.**
+
 ## Tests
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 at fold level: state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework amendment |
+| `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework |
 | `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 over HTTP incl. microsecond bitemporal reads; T15 worker API round-trip; T18–T22 planning loop; T24–T30 build loop; T33–T38 scan stage (real gitleaks+semgrep, clean/dirty/threshold/crash/integrity, route guards) |
+| `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation) |
 | `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

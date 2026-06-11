@@ -25,6 +25,9 @@ beforeAll(async () => {
   await pool.query('drop table if exists worker_events cascade');
   await pool.query('drop table if exists artifacts cascade');
   await pool.query('drop table if exists scan_attempts cascade');
+  await pool.query('drop table if exists approvers cascade');
+  await pool.query('drop table if exists approval_challenges cascade');
+  await pool.query('drop table if exists approvals cascade');
   await pool.query('drop table if exists schema_migrations cascade');
   await runMigrations(pool);
 });

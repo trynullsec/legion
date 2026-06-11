@@ -46,6 +46,7 @@ import {
   buildRevisionPrompt,
   type RejectionFeedback,
 } from './prompt.js';
+import { executeMerge, reconcileMerges, type MergeOutcome } from './merge.js';
 
 const exec = promisify(execFile);
 
@@ -440,13 +441,19 @@ export class Orchestrator {
     // recorded for the scan stage: the diff/scan base of this attempt
     await writeFile(path.join(attemptDir, 'base.sha'), `${baseSha}\n`);
 
-    // A build entered from a scan failure must carry the findings (pin 3);
-    // otherwise fall back to a prior failed-review summary (M3).
+    // Rework feedback precedence: a merge rejection (M5) or scan failure (M4)
+    // is more recent than any review summary (M3). The next coder prompt
+    // carries whichever triggered this build.
+    const mergeRejection = await this.lastMergeRejectionReason(missionId);
     const scanFindings = await this.lastScanFailureFindings(missionId);
-    const priorFailure =
-      scanFindings !== null
-        ? `the previous build failed the security scan. Fix these findings:\n${scanFindings}`
-        : await this.lastAttemptFailureSummary(missionId);
+    let priorFailure: string | null;
+    if (mergeRejection !== null) {
+      priorFailure = `the human reviewer rejected the previous merge. Reason: ${mergeRejection}`;
+    } else if (scanFindings !== null) {
+      priorFailure = `the previous build failed the security scan. Fix these findings:\n${scanFindings}`;
+    } else {
+      priorFailure = await this.lastAttemptFailureSummary(missionId);
+    }
 
     this.activeBuilds.add(missionId);
     try {
@@ -842,6 +849,35 @@ export class Orchestrator {
     return passed
       ? { kind: 'PASSED', sarifArtifactId: artifactId, counts }
       : { kind: 'FAILED', sarifArtifactId: artifactId, counts };
+  }
+
+  // ====================================================================
+  // M5: merge execution
+  // ====================================================================
+
+  /** Run the merge after a verified approval. Consumed by the daemon. */
+  async mergeMission(missionId: string, approvalId: string): Promise<MergeOutcome> {
+    return executeMerge(this.pool, {
+      missionId,
+      approvalId,
+      buildsRoot: this.buildsRoot,
+    });
+  }
+
+  /** Boot-time crash reconciliation for merges (pin 5d). */
+  async reconcileMerges(): Promise<string[]> {
+    return reconcileMerges(this.pool, { buildsRoot: this.buildsRoot });
+  }
+
+  /** Reason of the latest signed merge rejection, if it triggered this build. */
+  private async lastMergeRejectionReason(missionId: string): Promise<string | null> {
+    const events = await getMissionEvents(this.pool, missionId);
+    const lastRejected = [...events].reverse().find((e) => e.type === 'MERGE_REJECTED');
+    if (!lastRejected) return null;
+    // only relevant if no build has completed since the rejection
+    const lastBuildCompleted = [...events].reverse().find((e) => e.type === 'BUILD_COMPLETED');
+    if (lastBuildCompleted && lastBuildCompleted.seq > lastRejected.seq) return null;
+    return (lastRejected.payload.reason as string) ?? '(no reason recorded)';
   }
 
   /**
