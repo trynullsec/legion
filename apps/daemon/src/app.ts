@@ -376,6 +376,12 @@ export function createApp(
     return c.json({ registered: n > 0 });
   });
 
+  // Registration discoverability (M5 fix): boolean only, no sensitive data.
+  app.get('/api/auth/approver/status', async (c) => {
+    const n = await countApprovers(pool);
+    return c.json({ registered: n > 0 });
+  });
+
   app.post('/api/auth/approver/register-options', async (c) => {
     const result = await buildRegistrationOptions(pool);
     if (result.exists) {

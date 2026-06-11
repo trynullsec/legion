@@ -1,0 +1,15 @@
+/* NULLSEC LEGION design tokens — the brand is monochrome, dark only. */
+:root {
+  --bg: #0a0a0a;
+  --bg-raise: #111111;
+  --ink: #f4f2ec;
+  --ink-dim: rgba(244, 242, 236, 0.55);
+  --ink-faint: rgba(244, 242, 236, 0.28);
+  --hairline: rgba(244, 242, 236, 0.18);
+  --accent: #f4f2ec;
+  --danger: #c8553d;
+  --ok: #8a9a7b;
+
+  --serif: 'Playfair Display', Georgia, serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+}

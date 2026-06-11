@@ -176,8 +176,22 @@ afterAll(async () => {
 });
 
 describe('T39: approver registration', () => {
-  it('options → softkey attestation → stored; second registration → 409', async () => {
+  it('GET /status reports false before and true after; nothing sensitive leaks', async () => {
+    // before any registration
+    const before = await api('/api/auth/approver/status');
+    expect(before.status).toBe(200);
+    const beforeBody = await before.json();
+    expect(beforeBody).toEqual({ registered: false }); // boolean only, no extra keys
+
     approver = await registerApprover();
+
+    const after = await api('/api/auth/approver/status');
+    expect(after.status).toBe(200);
+    expect(await after.json()).toEqual({ registered: true });
+  });
+
+  it('options → softkey attestation → stored; second registration → 409', async () => {
+    // approver was registered in the status test above
     expect((await (await api('/api/auth/approver')).json()).registered).toBe(true);
 
     // a second registration attempt is refused

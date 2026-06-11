@@ -229,9 +229,12 @@ function groupAndFold(rows: WorkerEventRow[]): WorkerRecord[] {
     list.push(toStored(row));
     grouped.set(row.worker_id, list);
   }
-  const records = [...grouped.entries()].map(([workerId, events]) =>
-    foldWorker(workerId, events),
-  );
+  const records = [...grouped.entries()]
+    // worker_events also carries worker-less audit records (e.g.
+    // MERGE_CONFLICT under a synthetic id) — they are not workers and
+    // must not crash fold-everything paths like orphan reconciliation
+    .filter(([, events]) => events[0]?.type === 'WORKER_CREATED')
+    .map(([workerId, events]) => foldWorker(workerId, events));
   records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return records;
 }

@@ -40,10 +40,28 @@ export interface NewMission {
   riskLevel: RiskLevel;
 }
 
+/** Thrown for non-2xx responses; carries the server's error code + raw body. */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | null,
+    readonly raw: string,
+  ) {
+    super(code ?? `HTTP ${status}`);
+    this.name = 'ApiError';
+  }
+}
+
 async function asJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`${res.status}: ${body}`);
+    const raw = await res.text();
+    let code: string | null = null;
+    try {
+      code = (JSON.parse(raw) as { error?: string }).error ?? null;
+    } catch {
+      /* non-JSON body */
+    }
+    throw new ApiError(res.status, code, raw);
   }
   return (await res.json()) as T;
 }
@@ -271,7 +289,7 @@ export interface ApprovalInfo {
 
 export async function isApproverRegistered(): Promise<boolean> {
   const data = await asJson<{ registered: boolean }>(
-    await fetch('/api/auth/approver'),
+    await fetch('/api/auth/approver/status'),
   );
   return data.registered;
 }
