@@ -21,6 +21,7 @@ export interface Mission {
   kind: MissionKind;
   repoPath: string | null;
   deliverTo: string | null;
+  scheduledBy: string | null;
   riskLevel: RiskLevel;
   createdAt: string;
   updatedAt: string;
@@ -362,6 +363,90 @@ export async function submitReject(
       body: JSON.stringify({ response, reason }),
     }),
   );
+}
+
+// ---------- M6c: schedules ----------
+
+export interface ScheduleTemplate {
+  kind: MissionKind;
+  title: string;
+  objective: string;
+  repoPath?: string;
+  deliverTo?: string;
+  riskLevel: RiskLevel;
+}
+
+export interface Schedule {
+  id: string;
+  name: string;
+  cron: string;
+  template: ScheduleTemplate;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt: string | null;
+  lastOutcome: string | null;
+  lastFiredAt: string | null;
+}
+
+export interface ScheduleRun {
+  id: string;
+  scheduleId: string;
+  firedAt: string;
+  outcome: string;
+  missionId: string | null;
+  detail: string | null;
+}
+
+export async function fetchSchedules(): Promise<Schedule[]> {
+  const data = await asJson<{ schedules: Schedule[] }>(
+    await fetch('/api/schedules'),
+  );
+  return data.schedules;
+}
+
+export async function fetchSchedule(
+  id: string,
+): Promise<{ schedule: Schedule; runs: ScheduleRun[] }> {
+  return asJson(await fetch(`/api/schedules/${id}`));
+}
+
+export async function createSchedule(input: {
+  name: string;
+  cron: string;
+  template: ScheduleTemplate;
+  enabled?: boolean;
+}): Promise<Schedule> {
+  const data = await asJson<{ schedule: Schedule }>(
+    await fetch('/api/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+  );
+  return data.schedule;
+}
+
+export async function patchSchedule(
+  id: string,
+  patch: Partial<{ name: string; cron: string; template: ScheduleTemplate; enabled: boolean }>,
+): Promise<Schedule> {
+  const data = await asJson<{ schedule: Schedule }>(
+    await fetch(`/api/schedules/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    }),
+  );
+  return data.schedule;
+}
+
+export async function deleteSchedule(id: string): Promise<void> {
+  await asJson(await fetch(`/api/schedules/${id}`, { method: 'DELETE' }));
+}
+
+export async function runScheduleNow(id: string): Promise<void> {
+  await asJson(await fetch(`/api/schedules/${id}/run-now`, { method: 'POST' }));
 }
 
 export async function postMission(input: NewMission): Promise<Mission> {

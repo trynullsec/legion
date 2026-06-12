@@ -1,9 +1,12 @@
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import {
+  assertValidCron,
   EVENT_TYPES,
   IllegalTransitionError,
+  InvalidCronError,
   MISSION_KINDS,
+  nextRunAt,
   RISK_LEVELS,
 } from '@legion/core';
 import {
@@ -37,7 +40,21 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
-import { countApprovers, listApprovals } from '@legion/db';
+import {
+  countApprovers,
+  deleteSchedule,
+  getSchedule,
+  insertSchedule,
+  lastCreatedRun,
+  latestRun,
+  listApprovals,
+  listScheduleRuns,
+  listSchedules,
+  ScheduleNameConflictError,
+  updateSchedule,
+  type ScheduleRecord,
+} from '@legion/db';
+import type { Scheduler } from './scheduler.js';
 import {
   buildApprovalOptions,
   buildRegistrationOptions,
@@ -92,6 +109,51 @@ const createMissionSchema = z
 
 // M6b (pin 4): riskLevel is policy, not display — immutable after creation.
 // Any event payload trying to carry a riskLevel is rejected at the boundary.
+// M6c: a schedule's template is a mission-creation spec with the same
+// kind discrimination as POST /api/missions (code requires repoPath, task
+// forbids it; deliverTo is task-only). scheduledBy is set by the scheduler,
+// never accepted from a client.
+const templateSchema = z
+  .object({
+    kind: z.enum(MISSION_KINDS),
+    title: z.string().min(1),
+    objective: z.string().min(1),
+    repoPath: z.string().min(1).optional(),
+    deliverTo: z.string().min(1).optional(),
+    riskLevel: z.enum(RISK_LEVELS),
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    if (v.kind === 'code') {
+      if (!v.repoPath) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['repoPath'], message: 'code templates require repoPath' });
+      }
+      if (v.deliverTo) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['deliverTo'], message: 'deliverTo is only valid for task templates' });
+      }
+    } else if (v.repoPath) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['repoPath'], message: 'task templates must not name a repository' });
+    }
+  });
+
+const createScheduleSchema = z
+  .object({
+    name: z.string().min(1),
+    cron: z.string().min(1),
+    template: templateSchema,
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+
+const patchScheduleSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    cron: z.string().min(1).optional(),
+    template: templateSchema.optional(),
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+
 const appendEventSchema = z
   .object({
     type: z.enum(EVENT_TYPES),
@@ -171,6 +233,7 @@ function serializeMission(m: MissionRecord) {
     kind: m.kind,
     repoPath: m.repoPath,
     deliverTo: m.deliverTo,
+    scheduledBy: m.scheduledBy,
     riskLevel: m.riskLevel,
     createdAt: m.createdAt,
     updatedAt: m.updatedAt,
@@ -190,10 +253,36 @@ function serializeEvent(e: StoredEvent) {
   };
 }
 
+/** Schedule list/detail serializer with computed nextRunAt + last outcome. */
+async function serializeSchedule(pool: Pool, s: ScheduleRecord) {
+  const created = await lastCreatedRun(pool, s.id);
+  const last = await latestRun(pool, s.id);
+  const anchor = created ? new Date(created.firedAt) : new Date(s.createdAt);
+  let nextRunAtIso: string | null = null;
+  try {
+    nextRunAtIso = nextRunAt(s.cron, anchor).toISOString();
+  } catch {
+    nextRunAtIso = null; // an invalid stored cron never crashes the list
+  }
+  return {
+    id: s.id,
+    name: s.name,
+    cron: s.cron,
+    template: s.template,
+    enabled: s.enabled,
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
+    nextRunAt: nextRunAtIso,
+    lastOutcome: last?.outcome ?? null,
+    lastFiredAt: last?.firedAt ?? null,
+  };
+}
+
 export function createApp(
   pool: Pool,
   supervisor?: WorkerSupervisor,
   orchestrator?: Orchestrator,
+  scheduler?: Scheduler,
 ): Hono {
   const app = new Hono();
 
@@ -216,6 +305,101 @@ export function createApp(
   app.get('/api/missions', async (c) => {
     const missions = await listMissions(pool);
     return c.json({ missions: missions.map(serializeMission) });
+  });
+
+  // ---------- M6c: schedules ----------
+
+  const requireScheduler = () => {
+    if (!scheduler) throw new Error('scheduler is not configured');
+    return scheduler;
+  };
+
+  app.post('/api/schedules', async (c) => {
+    const parsed = createScheduleSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    try {
+      assertValidCron(parsed.data.cron);
+    } catch (e) {
+      if (e instanceof InvalidCronError) {
+        return c.json({ error: 'VALIDATION', message: e.message }, 400);
+      }
+      throw e;
+    }
+    try {
+      const schedule = await insertSchedule(pool, parsed.data);
+      return c.json({ schedule: await serializeSchedule(pool, schedule) }, 201);
+    } catch (e) {
+      if (e instanceof ScheduleNameConflictError) {
+        return c.json({ error: 'NAME_CONFLICT', name: e.scheduleName }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.get('/api/schedules', async (c) => {
+    const schedules = await listSchedules(pool);
+    const serialized = await Promise.all(
+      schedules.map((s) => serializeSchedule(pool, s)),
+    );
+    return c.json({ schedules: serialized });
+  });
+
+  app.get('/api/schedules/:id', async (c) => {
+    const schedule = await getSchedule(pool, c.req.param('id'));
+    if (!schedule) return c.json({ error: 'NOT_FOUND' }, 404);
+    const runs = await listScheduleRuns(pool, schedule.id);
+    return c.json({ schedule: await serializeSchedule(pool, schedule), runs });
+  });
+
+  app.patch('/api/schedules/:id', async (c) => {
+    const parsed = patchScheduleSchema.safeParse(await c.req.json());
+    if (!parsed.success) {
+      return c.json({ error: 'VALIDATION', issues: parsed.error.issues }, 400);
+    }
+    if (parsed.data.cron !== undefined) {
+      try {
+        assertValidCron(parsed.data.cron);
+      } catch (e) {
+        if (e instanceof InvalidCronError) {
+          return c.json({ error: 'VALIDATION', message: e.message }, 400);
+        }
+        throw e;
+      }
+    }
+    try {
+      const updated = await updateSchedule(pool, c.req.param('id'), parsed.data);
+      if (!updated) return c.json({ error: 'NOT_FOUND' }, 404);
+      return c.json({ schedule: await serializeSchedule(pool, updated) });
+    } catch (e) {
+      if (e instanceof ScheduleNameConflictError) {
+        return c.json({ error: 'NAME_CONFLICT', name: e.scheduleName }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.delete('/api/schedules/:id', async (c) => {
+    const ok = await deleteSchedule(pool, c.req.param('id'));
+    if (!ok) return c.json({ error: 'NOT_FOUND' }, 404);
+    return c.json({ deleted: true });
+  });
+
+  app.post('/api/schedules/:id/run-now', async (c) => {
+    const sched = requireScheduler();
+    if (!(await readEmptyBody(c))) {
+      return c.json(
+        { error: 'VALIDATION', message: 'this route accepts no body fields' },
+        400,
+      );
+    }
+    const result = await sched.runNow(c.req.param('id'));
+    if (result === null) return c.json({ error: 'NOT_FOUND' }, 404);
+    if (result.outcome === 'SKIPPED_DISABLED') {
+      return c.json({ error: 'SCHEDULE_DISABLED' }, 409);
+    }
+    return c.json({ result }, 202);
   });
 
   app.get('/api/missions/:id', async (c) => {

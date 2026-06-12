@@ -6,12 +6,14 @@ import { createPool } from '@legion/db';
 import { Orchestrator } from '@legion/orchestrator';
 import { WorkerSupervisor } from '@legion/runtime';
 import { createApp } from './app.js';
+import { Scheduler } from './scheduler.js';
 
 const PORT = 4242;
 
 const pool = createPool();
 const supervisor = new WorkerSupervisor({ pool });
 const orchestrator = new Orchestrator({ pool, supervisor });
+const scheduler = new Scheduler(pool, orchestrator);
 
 // Daemon restart with workers running: mark orphaned RUNNING workers FAILED.
 const orphaned = await supervisor.reconcileOrphans();
@@ -26,7 +28,11 @@ if (reconciledMerges.length > 0) {
   console.log(`reconciled ${reconciledMerges.length} merge(s):`, reconciledMerges);
 }
 
-const app = createApp(pool, supervisor, orchestrator);
+const app = createApp(pool, supervisor, orchestrator, scheduler);
+
+// M6c: start the scheduler loop. Its boot tick catches up any missed runs
+// (exactly once each) while the daemon was down.
+scheduler.start();
 
 // Serve the built Mission Board (apps/board/dist) for everything non-API.
 const boardDist = path.relative(

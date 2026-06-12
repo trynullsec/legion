@@ -5,13 +5,19 @@ import {
 } from '@simplewebauthn/browser';
 import {
   approvalOptions,
+  createSchedule,
+  deleteSchedule,
   fetchApproval,
   fetchDeliverable,
+  fetchSchedules,
   isApproverRegistered,
+  patchSchedule,
+  runScheduleNow,
   submitApprove,
   submitReject,
   type ApprovalInfo,
   type DeliverablePreview,
+  type Schedule,
 } from './api';
 import {
   ApiError,
@@ -1441,9 +1447,225 @@ function MissionDetail({
   );
 }
 
+function ScheduleForm({ onCreated }: { onCreated: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [cron, setCron] = useState('0 3 * * *');
+  const [kind, setKind] = useState<MissionKind>('code');
+  const [title, setTitle] = useState('');
+  const [objective, setObjective] = useState('');
+  const [repoPath, setRepoPath] = useState('');
+  const [deliverTo, setDeliverTo] = useState('');
+  const [riskLevel, setRiskLevel] = useState<RiskLevel>('low');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown | null>(null);
+
+  if (!open) {
+    return (
+      <button className="btn new-mission-toggle" onClick={() => setOpen(true)}>
+        + New Schedule
+      </button>
+    );
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await createSchedule({
+        name,
+        cron,
+        template: {
+          kind,
+          title,
+          objective,
+          riskLevel,
+          ...(kind === 'code' ? { repoPath } : {}),
+          ...(kind === 'task' && deliverTo.trim() ? { deliverTo: deliverTo.trim() } : {}),
+        },
+      });
+      setName(''); setTitle(''); setObjective(''); setRepoPath(''); setDeliverTo('');
+      setOpen(false);
+      onCreated();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="new-mission" onSubmit={submit}>
+      <div className="new-mission-head">
+        <span className="label">New Schedule</span>
+        <button type="button" className="btn btn-quiet" onClick={() => setOpen(false)}>
+          Close
+        </button>
+      </div>
+      <label>
+        name
+        <input value={name} onChange={(e) => setName(e.target.value)} required />
+        <span className="field-help">A unique label, e.g. "nightly-audit"</span>
+      </label>
+      <label>
+        cron <span className="mono small">(5-field, UTC)</span>
+        <input value={cron} onChange={(e) => setCron(e.target.value)} required />
+        <span className="field-help">
+          minute hour day-of-month month day-of-week — e.g. "0 3 * * *" = daily
+          03:00 UTC
+        </span>
+      </label>
+      <div className="kind-toggle" role="radiogroup" aria-label="template kind">
+        <button type="button" className={`btn ${kind === 'code' ? 'btn-primary' : ''}`}
+          aria-pressed={kind === 'code'} onClick={() => setKind('code')}>Code</button>
+        <button type="button" className={`btn ${kind === 'task' ? 'btn-primary' : ''}`}
+          aria-pressed={kind === 'task'} onClick={() => setKind('task')}>Task</button>
+        <span className="field-help">What each run produces</span>
+      </div>
+      <label>
+        title
+        <input value={title} onChange={(e) => setTitle(e.target.value)} required />
+        <span className="field-help">Title for every mission this schedule creates</span>
+      </label>
+      <label>
+        objective
+        <textarea value={objective} onChange={(e) => setObjective(e.target.value)} rows={3} required />
+        <span className="field-help">Agents read this verbatim each run</span>
+      </label>
+      {kind === 'code' && (
+        <label>
+          repo path
+          <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} required />
+          <span className="field-help">Absolute path to a local git repository</span>
+        </label>
+      )}
+      {kind === 'task' && (
+        <label>
+          deliver to <span className="mono small">(optional)</span>
+          <input value={deliverTo} onChange={(e) => setDeliverTo(e.target.value)}
+            placeholder="~/.legion/deliveries/<mission>/" />
+          <span className="field-help">Where each run's deliverable lands</span>
+        </label>
+      )}
+      <label>
+        risk level
+        <select value={riskLevel} onChange={(e) => setRiskLevel(e.target.value as RiskLevel)}>
+          <option value="low">low — express (plan auto-approved, hands-free to the gate)</option>
+          <option value="medium">medium — plan needs your approval</option>
+          <option value="high">high — strict scan (warnings block)</option>
+        </select>
+        <span className="field-help">
+          Every run still parks at the merge gate for your passkey.
+        </span>
+      </label>
+      <button type="submit" className="btn btn-primary" disabled={busy}>
+        {busy && <Star spin />} {busy ? 'Creating…' : 'Create Schedule'}
+      </button>
+      <Notice error={error} />
+    </form>
+  );
+}
+
+function SchedulesView() {
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [error, setError] = useState<unknown | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setSchedules(await fetchSchedules());
+      setError(null);
+    } catch (e) {
+      setError(e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), POLL_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const act = async (id: string, fn: () => Promise<void>) => {
+    setBusy(id);
+    setError(null);
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="board-frame">
+      <Corners />
+      <Notice error={error} />
+      <ScheduleForm onCreated={() => void load()} />
+      <table className="schedule-table mono" data-testid="schedules-table">
+        <thead>
+          <tr>
+            <th>name</th>
+            <th>cron (UTC)</th>
+            <th>next run</th>
+            <th>last</th>
+            <th>enabled</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {schedules.length === 0 && (
+            <tr><td colSpan={6} className="small">No schedules yet.</td></tr>
+          )}
+          {schedules.map((s) => (
+            <tr key={s.id}>
+              <td>{s.name}</td>
+              <td>{s.cron}</td>
+              <td className="small" title={s.nextRunAt ?? ''}>
+                {s.nextRunAt ? new Date(s.nextRunAt).toISOString().replace('.000Z', 'Z') : '—'}
+              </td>
+              <td className="small">{s.lastOutcome ?? '—'}</td>
+              <td>
+                <button
+                  className="linkish"
+                  disabled={busy === s.id}
+                  onClick={() => void act(s.id, () => patchSchedule(s.id, { enabled: !s.enabled }).then(() => {}))}
+                  aria-pressed={s.enabled}
+                >
+                  {s.enabled ? 'on' : 'off'}
+                </button>
+              </td>
+              <td>
+                <button
+                  className="btn"
+                  disabled={busy === s.id || !s.enabled}
+                  onClick={() => void act(s.id, () => runScheduleNow(s.id))}
+                >
+                  RUN NOW
+                </button>{' '}
+                <button
+                  className="btn btn-danger"
+                  disabled={busy === s.id}
+                  onClick={() => void act(s.id, () => deleteSchedule(s.id))}
+                >
+                  Delete
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function App() {
   const [missions, setMissions] = useState<Mission[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [view, setView] = useState<'board' | 'schedules'>('board');
   const [error, setError] = useState<string | null>(null);
   const [registered, setRegistered] = useState<boolean | null>(null);
 
@@ -1474,6 +1696,22 @@ export default function App() {
           <Star size={18} /> NULLSEC LEGION{' '}
           <span className="mono sub">/ MISSION BOARD</span>
         </h1>
+        <nav className="view-nav mono">
+          <button
+            className={`linkish ${view === 'board' ? 'active' : ''}`}
+            aria-pressed={view === 'board'}
+            onClick={() => { setView('board'); setSelected(null); }}
+          >
+            Board
+          </button>
+          <button
+            className={`linkish ${view === 'schedules' ? 'active' : ''}`}
+            aria-pressed={view === 'schedules'}
+            onClick={() => { setView('schedules'); setSelected(null); }}
+          >
+            Schedules
+          </button>
+        </nav>
         {registered === false && (
           <RegisterApproverButton
             label="Register approver"
@@ -1482,7 +1720,9 @@ export default function App() {
         )}
       </header>
       {error && <p className="error">api unreachable: {error}</p>}
-      {selected ? (
+      {view === 'schedules' ? (
+        <SchedulesView />
+      ) : selected ? (
         <MissionDetail missionId={selected} onBack={() => setSelected(null)} />
       ) : (
         <div className="board-frame">
@@ -1517,6 +1757,14 @@ export default function App() {
                       </span>
                       <span className="mono small">
                         <span className={`kind-tag kind-${m.kind}`}>{m.kind}</span>
+                        {m.scheduledBy && (
+                          <>
+                            {' '}
+                            <span className="kind-tag kind-scheduled" data-testid="scheduled-tag">
+                              SCHEDULED
+                            </span>
+                          </>
+                        )}
                         {' '}· risk {m.riskLevel} · {m.eventCount} events
                       </span>
                     </button>

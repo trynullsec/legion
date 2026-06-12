@@ -420,6 +420,52 @@ On a low-risk mission a human still disposes — by cancelling, or by letting
 the work reach the merge gate and rejecting there with a signed ceremony
 (the rework loop carries the reason as always).
 
+## Scheduled missions (Milestone 6c)
+
+Recurring work runs unattended — nightly audits, weekly reports — and only
+pings a human when a gate needs one. **The merge gate remains invariant: a
+scheduled mission parks at `AWAITING_MERGE_APPROVAL` like every other mission.
+Nothing merges or delivers while you sleep.**
+
+A **schedule** is a cron expression plus a mission template
+(`{kind, title, objective, repoPath?, deliverTo?, riskLevel}`). A 30s daemon
+tick fires due, enabled schedules; each firing creates a mission whose
+`MISSION_CREATED` payload carries `{scheduledBy}` and immediately starts
+planning. From there the M6b risk policy governs the flow — a **low-risk**
+template runs hands-free (plan auto-approved → build → scan) straight to the
+merge gate and waits for your passkey.
+
+- **UTC only (v0.1).** Cron is standard 5-field (`min hour dom month dow`),
+  evaluated in UTC — a daily job is exactly 24h apart with no daylight-saving
+  drift. Parsing is via the pinned `croner` dependency; the next-run
+  computation is a pure function in `@legion/core` (it takes `now` as an
+  argument, so it is unit-testable without time-travel hacks).
+- **One in flight, ever.** A schedule never fires while its most recent
+  created mission is non-terminal; the due tick records `SKIPPED_ACTIVE`
+  instead. The next tick after that mission reaches a terminal state fires
+  normally.
+- **Catch-up.** If the daemon was down across one *or more* intervals, the
+  next tick (and the boot tick) fires **exactly once**, not N times, then
+  anchors the next run on now. The `schedule_runs` row notes the catch-up.
+- **Mutation & deletion.** Changing a schedule's cron or template takes effect
+  from the next tick; in-flight missions are unaffected. Deleting a schedule
+  never touches its missions — `scheduledBy` keeps pointing at the dead id;
+  history is history.
+- **`run-now`** fires immediately under the same concurrency guard. Ticks
+  ignore disabled schedules silently; an explicit `run-now` on a disabled
+  schedule records `SKIPPED_DISABLED` and returns 409.
+
+### Schedule API
+
+```
+POST   /api/schedules              create (strict template, valid cron)
+GET    /api/schedules              list + computed nextRunAt + last outcome
+GET    /api/schedules/:id          detail + recent schedule_runs
+PATCH  /api/schedules/:id          update cron/template/enabled
+DELETE /api/schedules/:id          (missions untouched)
+POST   /api/schedules/:id/run-now  manual fire under the guard
+```
+
 ## Tests
 
 ### Execution protocol: two tiers
@@ -447,8 +493,9 @@ provisioned scanners are missing.
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework |
+| `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework; T62 next-run pure function (cron, UTC/DST, invalid rejection) |
 | `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation); T48–T54 task missions (kind boundary, real deliverable production, gitleaks-on-deliverables, tamper-voiding, EMPTY_DELIVERABLE, tar delivery, reviewer loop) |
+| `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation); T48–T54 task missions (kind boundary, real deliverable production, gitleaks-on-deliverables, tamper-voiding, EMPTY_DELIVERABLE, tar delivery, reviewer loop); T55–T60 express lane (risk-proportional plan gating, scan thresholds, gate invariance, riskLevel immutability); T63–T68 scheduled missions (real firing, concurrency guard, catch-up, run-now/disabled, CRUD) |
+| `apps/board` | M5.5 operator-UX smokes; T61 risk-policy notices (express / strict-scan); T69 schedules view + SCHEDULED tag |
 | `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

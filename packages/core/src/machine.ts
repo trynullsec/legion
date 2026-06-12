@@ -129,6 +129,7 @@ export function foldMission(
     kind: creation.kind ?? 'code',
     repoPath: creation.repoPath ?? null,
     deliverTo: creation.deliverTo ?? null,
+    scheduledBy: creation.scheduledBy ?? null,
     riskLevel: creation.riskLevel,
   };
 }

@@ -58,6 +58,8 @@ export interface MissionCreationPayload {
   repoPath?: string;
   /** kind=task only: delivery directory; default ~/.legion/deliveries/<missionId>/. */
   deliverTo?: string;
+  /** M6c: id of the schedule that fired this mission, if any. */
+  scheduledBy?: string;
 }
 
 /** The minimal shape core needs to fold a mission's event log. */
@@ -77,5 +79,7 @@ export interface MissionSnapshot {
   repoPath: string | null;
   /** null for code missions and task missions using the default. */
   deliverTo: string | null;
+  /** M6c: the schedule that created this mission, or null for manual ones. */
+  scheduledBy: string | null;
   riskLevel: RiskLevel;
 }

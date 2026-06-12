@@ -48,3 +48,22 @@ export type {
   ApprovalRecord,
   ApproverRecord,
 } from './approvals.js';
+export {
+  deleteSchedule,
+  getSchedule,
+  insertSchedule,
+  insertScheduleRun,
+  lastCreatedRun,
+  latestRun,
+  listEnabledSchedules,
+  listScheduleRuns,
+  listSchedules,
+  ScheduleNameConflictError,
+  updateSchedule,
+} from './schedules.js';
+export type {
+  ScheduleRecord,
+  ScheduleRunOutcome,
+  ScheduleRunRecord,
+  ScheduleTemplate,
+} from './schedules.js';
