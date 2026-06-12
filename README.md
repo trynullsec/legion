@@ -397,6 +397,29 @@ events would be a ledger-compat break; the UI shows friendlier stage labels).
   Boot reconciliation detects a completed-but-unrecorded delivery by manifest
   hashes in `deliverTo` and emits the event exactly once (T47 semantics).
 
+## Risk-proportional pipelines (Milestone 6b)
+
+`riskLevel` is load-bearing: the pipeline's human checkpoints scale with
+declared risk. **The merge gate never scales away — every mission, every risk
+level, ends at the passkey ceremony. No bypass exists.**
+
+One policy module (`packages/orchestrator/src/policy.ts`) defines the map,
+applied identically to code and task missions:
+
+| Risk | Plan gate | Scan threshold |
+| --- | --- | --- |
+| `low` | **Auto-approved**: a schema-valid `PLAN_PROPOSED` is immediately followed by `PLAN_APPROVED {autoApproved: true, policy: 'risk:low'}` and the build auto-starts. The reviewer stage is unchanged. | default (`error`) |
+| `medium` | Human approval, exactly as before — the literal default. | default (env-configurable) |
+| `high` | Human approval, as before. | **forced `warning`** for this mission — warning-level findings block; the env var stays the global default for everyone else |
+
+The ledger records that a gate was waived **by declared policy, never
+silently** — auto-approval is the same `PLAN_APPROVED` event with a policy
+payload; no new event types, no state-machine changes. `riskLevel` is
+immutable after creation: any event payload carrying one is rejected with 400.
+On a low-risk mission a human still disposes — by cancelling, or by letting
+the work reach the merge gate and rejecting there with a signed ceremony
+(the rework loop carries the reason as always).
+
 ## Tests
 
 ### Execution protocol: two tiers

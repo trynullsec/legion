@@ -203,8 +203,18 @@ export function nextAction(
   state: string,
   live: LiveWorkerInfo,
   kind: 'code' | 'task' = 'code',
+  riskLevel: 'low' | 'medium' | 'high' = 'medium',
 ): NextAction {
   const task = kind === 'task';
+  // M6b: a low-risk mission flows from "Start planning" straight through
+  // live status lines until the merge gate — the plan gate auto-approves.
+  if (state === 'AWAITING_PLAN_APPROVAL' && riskLevel === 'low') {
+    return {
+      kind: 'status',
+      text: 'Express policy is approving the plan…',
+      spinning: true,
+    };
+  }
   switch (state) {
     case 'DRAFT':
       return {

@@ -125,7 +125,10 @@ async function createMissionViaApi(objective: string): Promise<string> {
     title: 'Add input validation to tiny-math',
     objective,
     repoPath: fixtureRepo,
-    riskLevel: 'low',
+    // M2 wrote 'low' when risk was display-only. Since M6b, low-risk plans
+    // auto-approve — these tests assert the HUMAN plan gate, which is the
+    // medium-risk (default) flow. The low-risk express path is T55/T58.
+    riskLevel: 'medium',
   });
   expect(res.status).toBe(201);
   return (await res.json()).mission.missionId as string;

@@ -58,6 +58,7 @@ import {
   type DeliveryOutcome,
   type MergeOutcome,
 } from './merge.js';
+import { riskPolicy } from './policy.js';
 
 const exec = promisify(execFile);
 
@@ -403,6 +404,28 @@ export class Orchestrator {
       }
       throw e;
     }
+
+    // M6b (pin 1): low-risk express lane — the plan gate auto-approves BY
+    // DECLARED POLICY, recorded in the ledger, and the build starts
+    // immediately. Only the PLAN gate scales; the merge gate is invariant.
+    const policy = riskPolicy(mission.riskLevel);
+    if (policy.autoApprovePlan) {
+      try {
+        await appendEvent(this.pool, missionId, 'PLAN_APPROVED', {
+          autoApproved: true,
+          policy: policy.policyId,
+        });
+        const { settled } = await this.startBuild(missionId);
+        void settled.catch((e) =>
+          console.error(`auto-build for ${missionId} failed:`, e),
+        );
+      } catch (e) {
+        // the proposal stands even if auto-approval/auto-build hit a race;
+        // the mission simply parks where it is
+        console.error(`express-lane policy for ${missionId} failed:`, e);
+      }
+    }
+
     return { kind: 'PROPOSED', plan: validated.data };
   }
 
@@ -782,12 +805,23 @@ export class Orchestrator {
     }
     const attemptDir = path.join(missionBuilds, `attempt-${latest}`);
 
+    // M6b (pin 1): high risk forces the warning threshold FOR THIS MISSION;
+    // the env var stays the global default for everything else. An explicit
+    // internal override (tests) still wins.
+    const effective: ScanOverrides = {
+      ...overrides,
+      failLevel:
+        overrides.failLevel ??
+        riskPolicy(result.mission.riskLevel).scanFailLevel ??
+        undefined,
+    };
+
     // M6a (pin 4): task missions scan the deliverables with gitleaks only
     if (result.mission.kind === 'task') {
       const deliverablesDir = path.join(attemptDir, 'work', 'deliverables');
       this.activeScans.add(missionId);
       await appendEvent(this.pool, missionId, 'SCAN_STARTED', { attempt: latest });
-      const settled = this.runTaskScan(missionId, deliverablesDir, overrides).finally(
+      const settled = this.runTaskScan(missionId, deliverablesDir, effective).finally(
         () => {
           this.activeScans.delete(missionId);
         },
@@ -801,7 +835,7 @@ export class Orchestrator {
     this.activeScans.add(missionId);
     await appendEvent(this.pool, missionId, 'SCAN_STARTED', { attempt: latest });
 
-    const settled = this.runScan(missionId, repoDir, baseSha, overrides).finally(
+    const settled = this.runScan(missionId, repoDir, baseSha, effective).finally(
       () => {
         this.activeScans.delete(missionId);
       },

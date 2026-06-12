@@ -28,3 +28,5 @@ export {
 export type { RejectionFeedback } from './prompt.js';
 export { executeDelivery, executeMerge, reconcileMerges } from './merge.js';
 export type { DeliveryOutcome, MergeOutcome } from './merge.js';
+export { riskPolicy } from './policy.js';
+export type { RiskPolicy } from './policy.js';

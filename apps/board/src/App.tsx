@@ -480,12 +480,24 @@ function PlanSection({
   const awaiting = mission.state === 'AWAITING_PLAN_APPROVAL';
   if (!awaiting && !plan) return null;
 
+  // M6b: the ledger records when the plan gate was waived by declared policy
+  const autoApproval = [...events]
+    .reverse()
+    .find((e) => e.type === 'PLAN_APPROVED' && e.payload.autoApproved === true);
+
   return (
     <section className="plan" id="plan-section">
       <Divider
         label="Plan"
         hint="Proposed by an agent that read your repo — approve it or reject with a reason."
       />
+      {autoApproval && (
+        <p className="mono small policy-note" data-testid="express-note">
+          EXPRESS · PLAN AUTO-APPROVED — waived by declared policy (
+          {String(autoApproval.payload.policy ?? 'risk:low')}); the merge gate
+          still requires your passkey.
+        </p>
+      )}
       <Notice error={error} />
 
       {plan && (
@@ -1244,7 +1256,7 @@ function NextActionBar({
     hasLiveReviewer: workers.some((w) => w.role === 'reviewer' && isLive(w)),
     hasLiveTaskWorker: workers.some((w) => w.role === 'worker' && isLive(w)),
   };
-  const action = nextAction(mission.state, live, mission.kind);
+  const action = nextAction(mission.state, live, mission.kind, mission.riskLevel);
 
   const run = async (kind: 'plan' | 'build') => {
     setBusy(true);
@@ -1378,6 +1390,11 @@ function MissionDetail({
             </span>
             <span className={`kind-tag kind-${mission.kind}`}>{mission.kind}</span>
             <span className="mono">risk: {mission.riskLevel}</span>
+            {mission.riskLevel === 'high' && (
+              <span className="mono policy-note" data-testid="strict-note">
+                STRICT SCAN · WARNINGS BLOCK
+              </span>
+            )}
             <span className="mono">
               {mission.kind === 'task'
                 ? `deliver to: ${mission.deliverTo ?? 'default (~/.legion/deliveries)'}`

@@ -90,10 +90,17 @@ const createMissionSchema = z
     }
   });
 
+// M6b (pin 4): riskLevel is policy, not display — immutable after creation.
+// Any event payload trying to carry a riskLevel is rejected at the boundary.
 const appendEventSchema = z
   .object({
     type: z.enum(EVENT_TYPES),
-    payload: z.record(z.unknown()).optional(),
+    payload: z
+      .record(z.unknown())
+      .optional()
+      .refine((p) => p === undefined || !('riskLevel' in p), {
+        message: 'riskLevel is immutable after creation',
+      }),
   })
   .strict();
 
