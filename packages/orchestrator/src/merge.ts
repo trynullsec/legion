@@ -1,16 +1,19 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { readdir } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { IllegalTransitionError } from '@legion/core';
 import {
   appendEvent,
   appendWorkerEvent,
+  getArtifact,
   getMission,
   getMissionEvents,
   listApprovals,
   listArtifacts,
+  type MissionRecord,
 } from '@legion/db';
 import type { Pool } from 'pg';
 
@@ -21,6 +24,11 @@ export type MergeOutcome =
   | { kind: 'BLOCKED_DIRTY' }
   | { kind: 'CONFLICT' }
   | { kind: 'NO_WORKSPACE' };
+
+export type DeliveryOutcome =
+  | { kind: 'DELIVERED'; deliveredTo: string; approvalId: string }
+  | { kind: 'NO_DELIVERABLE' }
+  | { kind: 'DELIVERY_FAILED'; error: string };
 
 async function git(cwd: string, ...args: string[]) {
   return exec('git', ['-C', cwd, ...args], { maxBuffer: 64 * 1024 * 1024 });
@@ -88,6 +96,7 @@ export async function executeMerge(
   const result = await getMission(pool, missionId);
   if (!result) return { kind: 'NO_WORKSPACE' };
   const mission = result.mission;
+  if (!mission.repoPath) return { kind: 'NO_WORKSPACE' }; // task missions deliver, not merge
   const userRepo = path.resolve(mission.repoPath);
 
   const attemptRepo = await latestAttemptRepo(buildsRoot, missionId);
@@ -150,14 +159,149 @@ export async function executeMerge(
   return { kind: 'MERGED', mergeCommit, approvalId };
 }
 
+// ---------- M6a: task-mission delivery (pin 6) ----------
+
+interface DeliverableManifest {
+  artifactId: string;
+  archive: boolean;
+  files: { name: string; sha256: string }[];
+}
+
+/** The latest BUILD_COMPLETED deliverable manifest, from the ledger. */
+async function deliverableManifest(
+  pool: Pool,
+  missionId: string,
+): Promise<DeliverableManifest | null> {
+  const events = await getMissionEvents(pool, missionId);
+  const completed = [...events]
+    .reverse()
+    .find((e) => e.type === 'BUILD_COMPLETED' && e.payload.deliverable);
+  if (!completed) return null;
+  const d = completed.payload.deliverable as {
+    archive: boolean;
+    files: { name: string; sha256: string }[];
+  };
+  return {
+    artifactId: completed.payload.artifactId as string,
+    archive: d.archive,
+    files: d.files,
+  };
+}
+
+export function defaultDeliverTo(
+  deliveriesRoot: string,
+  mission: MissionRecord,
+): string {
+  return mission.deliverTo ?? path.join(deliveriesRoot, mission.missionId);
+}
+
+/**
+ * Execute the delivery after a verified approval (pin 6): copy the
+ * deliverable into deliverTo, verify the copy's hashes against the
+ * build-time manifest, and ONLY THEN emit MERGE_APPROVED with deliveredTo.
+ */
+export async function executeDelivery(
+  pool: Pool,
+  opts: { missionId: string; approvalId: string; deliveriesRoot: string },
+): Promise<DeliveryOutcome> {
+  const { missionId, approvalId, deliveriesRoot } = opts;
+  const result = await getMission(pool, missionId);
+  if (!result) return { kind: 'NO_DELIVERABLE' };
+  const mission = result.mission;
+
+  const manifest = await deliverableManifest(pool, missionId);
+  if (!manifest) return { kind: 'NO_DELIVERABLE' };
+  const artifact = await getArtifact(pool, manifest.artifactId);
+  if (!artifact) return { kind: 'NO_DELIVERABLE' };
+
+  const deliverTo = defaultDeliverTo(deliveriesRoot, mission);
+  await mkdir(deliverTo, { recursive: true });
+
+  try {
+    if (manifest.archive) {
+      await exec('tar', ['-xf', artifact.path, '-C', deliverTo]);
+    } else {
+      const only = manifest.files[0]!;
+      const body = await readFile(artifact.path);
+      const target = path.join(deliverTo, only.name);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, body);
+    }
+  } catch (e) {
+    return { kind: 'DELIVERY_FAILED', error: String(e) };
+  }
+
+  // verify every delivered file's hash against the build-time manifest
+  for (const f of manifest.files) {
+    let copied: Buffer;
+    try {
+      copied = await readFile(path.join(deliverTo, f.name));
+    } catch {
+      return { kind: 'DELIVERY_FAILED', error: `${f.name} missing after copy` };
+    }
+    const actual = createHash('sha256').update(copied).digest('hex');
+    if (actual !== f.sha256) {
+      return { kind: 'DELIVERY_FAILED', error: `${f.name} hash mismatch after copy` };
+    }
+  }
+
+  // copy verified — now (and only now) the ledger says MERGED (pin 8: event
+  // names stay canonical; the UI may label this stage "Delivered")
+  const hashes = await artifactHashes(pool, missionId);
+  await emitMergeApproved(pool, missionId, {
+    approvalId,
+    artifactSha256s: { deliverable: artifact.sha256, sarif: hashes.sarif },
+    deliveredTo: deliverTo,
+  });
+
+  return { kind: 'DELIVERED', deliveredTo: deliverTo, approvalId };
+}
+
+/**
+ * M6a boot reconciliation: a delivery may have completed while the daemon
+ * died before emitting MERGE_APPROVED. If every manifest file is present in
+ * deliverTo with a matching hash, the delivery happened — emit exactly once
+ * (T47 semantics).
+ */
+async function reconcileDelivery(
+  pool: Pool,
+  mission: MissionRecord,
+  deliveriesRoot: string,
+): Promise<boolean> {
+  const approvals = (await listApprovals(pool, mission.missionId)).filter(
+    (a) => a.decision === 'approve',
+  );
+  if (approvals.length === 0) return false;
+  const manifest = await deliverableManifest(pool, mission.missionId);
+  if (!manifest) return false;
+  const artifact = await getArtifact(pool, manifest.artifactId);
+  if (!artifact) return false;
+
+  const deliverTo = defaultDeliverTo(deliveriesRoot, mission);
+  for (const f of manifest.files) {
+    let copied: Buffer;
+    try {
+      copied = await readFile(path.join(deliverTo, f.name));
+    } catch {
+      return false; // not delivered
+    }
+    if (createHash('sha256').update(copied).digest('hex') !== f.sha256) {
+      return false;
+    }
+  }
+
+  const hashes = await artifactHashes(pool, mission.missionId);
+  return emitMergeApproved(pool, mission.missionId, {
+    approvalId: approvals[approvals.length - 1]!.id,
+    artifactSha256s: { deliverable: artifact.sha256, sarif: hashes.sarif },
+    deliveredTo: deliverTo,
+  });
+}
+
 async function emitMergeApproved(
   pool: Pool,
   missionId: string,
-  payload: {
-    approvalId: string;
-    artifactSha256s: { diff: string | null; sarif: string | null };
-    mergeCommit: string;
-  },
+  payload: Record<string, unknown> & { approvalId: string },
 ): Promise<boolean> {
   try {
     await appendEvent(pool, missionId, 'MERGE_APPROVED', payload);
@@ -178,7 +322,7 @@ async function emitMergeApproved(
  */
 export async function reconcileMerges(
   pool: Pool,
-  opts: { buildsRoot: string },
+  opts: { buildsRoot: string; deliveriesRoot?: string },
 ): Promise<string[]> {
   const { rows } = await pool.query<{ mission_id: string }>(
     `select distinct mission_id from approvals where decision = 'approve'`,
@@ -189,7 +333,17 @@ export async function reconcileMerges(
     const result = await getMission(pool, missionId);
     if (!result || result.mission.state !== 'AWAITING_MERGE_APPROVAL') continue;
 
-    const userRepo = path.resolve(result.mission.repoPath);
+    // M6a: task missions reconcile by delivered-file hashes, not merge commits
+    if (result.mission.kind === 'task') {
+      const deliveriesRoot =
+        opts.deliveriesRoot ?? path.join(os.homedir(), '.legion', 'deliveries');
+      if (await reconcileDelivery(pool, result.mission, deliveriesRoot)) {
+        reconciled.push(missionId);
+      }
+      continue;
+    }
+
+    const userRepo = path.resolve(result.mission.repoPath!);
     const approvals = (await listApprovals(pool, missionId)).filter(
       (a) => a.decision === 'approve',
     );

@@ -19,6 +19,7 @@ export {
   DEFAULT_SEMGREP_CONFIGS,
   LEGION_RULES_DIR,
   runGitleaks,
+  runGitleaksDir,
   runSemgrep,
   ScannerCrashError,
 } from './runners.js';

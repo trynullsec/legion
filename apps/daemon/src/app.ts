@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   EVENT_TYPES,
   IllegalTransitionError,
+  MISSION_KINDS,
   RISK_LEVELS,
 } from '@legion/core';
 import {
@@ -32,8 +33,10 @@ import {
   ScanStateError,
   type Orchestrator,
 } from '@legion/orchestrator';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { countApprovers, listApprovals } from '@legion/db';
 import {
   buildApprovalOptions,
@@ -47,14 +50,45 @@ import type { Pool } from 'pg';
 
 // Every HTTP boundary schema is strict: unknown keys (e.g. smuggled internal
 // overrides like taskOverride) are rejected with 400, never passed through.
+// M6a (pin 1): kind discrimination — code requires repoPath, task forbids it;
+// deliverTo belongs to task missions only.
 const createMissionSchema = z
   .object({
     title: z.string().min(1),
     objective: z.string().min(1),
-    repoPath: z.string().min(1),
+    kind: z.enum(MISSION_KINDS).optional(),
+    repoPath: z.string().min(1).optional(),
+    deliverTo: z.string().min(1).optional(),
     riskLevel: z.enum(RISK_LEVELS),
   })
-  .strict();
+  .strict()
+  .superRefine((v, ctx) => {
+    const kind = v.kind ?? 'code';
+    if (kind === 'code') {
+      if (!v.repoPath) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['repoPath'],
+          message: 'code missions require repoPath',
+        });
+      }
+      if (v.deliverTo) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['deliverTo'],
+          message: 'deliverTo is only valid for task missions',
+        });
+      }
+    } else {
+      if (v.repoPath) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['repoPath'],
+          message: 'task missions must not name a repository',
+        });
+      }
+    }
+  });
 
 const appendEventSchema = z
   .object({
@@ -104,6 +138,8 @@ const rejectMergeSchema = z
   })
   .strict();
 
+const execFileAsync = promisify(execFile);
+
 /** Routes that take no body still reject any unknown keys (pin 9). */
 const emptyBodySchema = z.object({}).strict();
 
@@ -125,7 +161,9 @@ function serializeMission(m: MissionRecord) {
     state: m.state,
     title: m.title,
     objective: m.objective,
+    kind: m.kind,
     repoPath: m.repoPath,
+    deliverTo: m.deliverTo,
     riskLevel: m.riskLevel,
     createdAt: m.createdAt,
     updatedAt: m.updatedAt,
@@ -160,6 +198,10 @@ export function createApp(
         400,
       );
     }
+    // Back-compat (pin 1 / T48): a code mission created without `kind` stores
+    // its payload unchanged — folding defaults absent kind to 'code', so every
+    // pre-M6a creation payload (and its tests) is untouched. Task missions
+    // carry kind:'task' verbatim from the client.
     const mission = await createMission(pool, parsed.data);
     return c.json({ mission: serializeMission(mission) }, 201);
   });
@@ -452,6 +494,25 @@ export function createApp(
       return c.json({ error: ceremony.error }, ceremony.status);
     }
 
+    // M6a: task missions deliver files instead of merging into a repository
+    if (mission.mission.kind === 'task') {
+      const delivery = await orch.deliverMission(missionId, ceremony.approval.id);
+      if (delivery.kind === 'DELIVERED') {
+        return c.json({
+          delivered: true,
+          approvalId: ceremony.approval.id,
+          deliveredTo: delivery.deliveredTo,
+        });
+      }
+      if (delivery.kind === 'NO_DELIVERABLE') {
+        return c.json({ error: 'NO_DELIVERABLE' }, 409);
+      }
+      return c.json(
+        { error: 'DELIVERY_FAILED', message: delivery.error },
+        409,
+      );
+    }
+
     // verified approval recorded — now (and only now) execute the merge
     const outcome = await orch.mergeMission(missionId, ceremony.approval.id);
     if (outcome.kind === 'MERGED') {
@@ -588,6 +649,67 @@ export function createApp(
         stderrTail: scan.stderrTail,
         createdAt: scan.createdAt,
       },
+    });
+  });
+
+  // M6a (pin 5): deliverable preview for the task-mission gate. Returns the
+  // file manifest with utf8 contents (truncated for display); the artifact
+  // hash is re-verified on read, same integrity rule as /api/artifacts/:id.
+  app.get('/api/missions/:id/deliverable', async (c) => {
+    const missionId = c.req.param('id');
+    const result = await getMission(pool, missionId);
+    if (!result) return c.json({ error: 'NOT_FOUND' }, 404);
+
+    const completed = [...result.events]
+      .reverse()
+      .find((e) => e.type === 'BUILD_COMPLETED' && e.payload.deliverable);
+    if (!completed) return c.json({ deliverable: null });
+    const manifest = completed.payload.deliverable as {
+      archive: boolean;
+      files: { name: string; sha256: string }[];
+    };
+    const artifactId = completed.payload.artifactId as string;
+    const artifact = await getArtifact(pool, artifactId);
+    if (!artifact) return c.json({ deliverable: null });
+
+    let body: Buffer;
+    try {
+      body = await readFile(artifact.path);
+    } catch {
+      return c.json({ error: 'INTEGRITY', message: 'artifact file missing' }, 409);
+    }
+    const actual = createHash('sha256').update(body).digest('hex');
+    if (actual !== artifact.sha256) {
+      return c.json({ error: 'INTEGRITY', expected: artifact.sha256, actual }, 409);
+    }
+
+    const MAX_PREVIEW = 20_000;
+    const files: { name: string; sha256: string; content: string; truncated: boolean }[] = [];
+    for (const f of manifest.files) {
+      let content: string;
+      if (manifest.archive) {
+        try {
+          const { stdout } = await execFileAsync(
+            'tar', ['-xOf', artifact.path, f.name],
+            { maxBuffer: 64 * 1024 * 1024 },
+          );
+          content = stdout;
+        } catch {
+          content = '(unreadable)';
+        }
+      } else {
+        content = body.toString('utf8');
+      }
+      files.push({
+        name: f.name,
+        sha256: f.sha256,
+        content: content.slice(0, MAX_PREVIEW),
+        truncated: content.length > MAX_PREVIEW,
+      });
+    }
+
+    return c.json({
+      deliverable: { archive: manifest.archive, sha256: artifact.sha256, files },
     });
   });
 

@@ -11,12 +11,16 @@ export type MissionState =
 
 export type RiskLevel = 'low' | 'medium' | 'high';
 
+export type MissionKind = 'code' | 'task';
+
 export interface Mission {
   missionId: string;
   state: MissionState;
   title: string;
   objective: string;
-  repoPath: string;
+  kind: MissionKind;
+  repoPath: string | null;
+  deliverTo: string | null;
   riskLevel: RiskLevel;
   createdAt: string;
   updatedAt: string;
@@ -36,7 +40,9 @@ export interface MissionEvent {
 export interface NewMission {
   title: string;
   objective: string;
-  repoPath: string;
+  kind: MissionKind;
+  repoPath?: string;
+  deliverTo?: string;
   riskLevel: RiskLevel;
 }
 
@@ -308,13 +314,40 @@ export async function approvalOptions(missionId: string): Promise<unknown> {
 export async function submitApprove(
   missionId: string,
   response: unknown,
-): Promise<{ mergeCommit?: string; error?: string }> {
+): Promise<{
+  mergeCommit?: string;
+  delivered?: boolean;
+  deliveredTo?: string;
+  error?: string;
+}> {
   const res = await fetch(`/api/missions/${missionId}/approve`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ response }),
   });
-  return (await res.json()) as { mergeCommit?: string; error?: string };
+  return (await res.json()) as {
+    mergeCommit?: string;
+    delivered?: boolean;
+    deliveredTo?: string;
+    error?: string;
+  };
+}
+
+// ---------- M6a: task-mission deliverable preview ----------
+
+export interface DeliverablePreview {
+  archive: boolean;
+  sha256: string;
+  files: { name: string; sha256: string; content: string; truncated: boolean }[];
+}
+
+export async function fetchDeliverable(
+  missionId: string,
+): Promise<DeliverablePreview | null> {
+  const res = await fetch(`/api/missions/${missionId}/deliverable`);
+  if (res.status === 404) return null;
+  const data = await asJson<{ deliverable: DeliverablePreview | null }>(res);
+  return data.deliverable;
 }
 
 export async function submitReject(

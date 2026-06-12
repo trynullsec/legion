@@ -125,7 +125,10 @@ export function foldMission(
     state,
     title: creation.title,
     objective: creation.objective,
-    repoPath: creation.repoPath,
+    // pre-M6a events carry no kind: they are code missions by definition
+    kind: creation.kind ?? 'code',
+    repoPath: creation.repoPath ?? null,
+    deliverTo: creation.deliverTo ?? null,
     riskLevel: creation.riskLevel,
   };
 }

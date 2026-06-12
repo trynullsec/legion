@@ -49,10 +49,15 @@ export async function recomputeBoundHashes(
   missionId: string,
 ): Promise<BoundHashes> {
   const artifacts = await listArtifacts(pool, missionId);
-  const diff = [...artifacts].reverse().find((a) => a.type === 'diff');
+  // M6a: the primary artifact is the diff for code missions and the
+  // deliverable for task missions — the binding rule is identical. The hash
+  // keeps the `diff` slot so the challenge derivation stays canonical.
+  const diff = [...artifacts]
+    .reverse()
+    .find((a) => a.type === 'diff' || a.type === 'deliverable');
   const sarif = [...artifacts].reverse().find((a) => a.type === 'sarif');
   if (!diff || !sarif) {
-    throw new IntegrityError('mission is missing a diff and/or SARIF artifact');
+    throw new IntegrityError('mission is missing a primary and/or SARIF artifact');
   }
   for (const a of [diff, sarif]) {
     let content: Buffer;

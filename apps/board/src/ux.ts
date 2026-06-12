@@ -154,7 +154,7 @@ export function summarizeEvent(e: WorkerEvent): FeedLine | null {
       return {
         text:
           p.verdict === 'approve'
-            ? 'Reviewer approved the diff'
+            ? 'Reviewer approved the work'
             : 'Reviewer requested changes',
         danger: p.verdict !== 'approve',
       };
@@ -182,6 +182,8 @@ export interface LiveWorkerInfo {
   hasLivePlanner: boolean;
   hasLiveCoder: boolean;
   hasLiveReviewer: boolean;
+  /** M6a: 'worker' role agents on task missions. */
+  hasLiveTaskWorker: boolean;
 }
 
 export type NextAction =
@@ -193,28 +195,41 @@ export type NextAction =
 
 /**
  * The single next human step for a mission state. Pure mapping over state +
- * which workers are live — it renders guidance, it does not gate the API
- * (the server remains the source of truth).
+ * kind + which workers are live — it renders guidance, it does not gate the
+ * API (the server remains the source of truth). M6a: copy adapts by kind;
+ * states and event names stay canonical (pin 8).
  */
 export function nextAction(
   state: string,
   live: LiveWorkerInfo,
+  kind: 'code' | 'task' = 'code',
 ): NextAction {
+  const task = kind === 'task';
   switch (state) {
     case 'DRAFT':
       return {
         kind: 'button',
         label: 'Start planning',
-        help: 'Agents will read your repo and propose a plan.',
+        help: task
+          ? 'An agent will plan the deliverable from your objective.'
+          : 'Agents will read your repo and propose a plan.',
         action: 'plan',
       };
     case 'PLANNING':
       return live.hasLivePlanner
-        ? { kind: 'status', text: 'Planner is reading your repository…', spinning: true }
+        ? {
+            kind: 'status',
+            text: task
+              ? 'Planner is shaping the deliverable…'
+              : 'Planner is reading your repository…',
+            spinning: true,
+          }
         : {
             kind: 'button',
             label: 'Start planning',
-            help: 'Agents will read your repo and propose a plan.',
+            help: task
+              ? 'An agent will plan the deliverable from your objective.'
+              : 'Agents will read your repo and propose a plan.',
             action: 'plan',
           };
     case 'AWAITING_PLAN_APPROVAL':
@@ -225,31 +240,52 @@ export function nextAction(
         target: 'plan-section',
       };
     case 'BUILDING':
+      if (live.hasLiveTaskWorker)
+        return {
+          kind: 'status',
+          text: 'Agent is working on your deliverable…',
+          spinning: true,
+        };
       if (live.hasLiveCoder)
         return { kind: 'status', text: 'Coder is implementing the plan…', spinning: true };
       if (live.hasLiveReviewer)
-        return { kind: 'status', text: 'Reviewer is reading the diff…', spinning: true };
+        return {
+          kind: 'status',
+          text: task
+            ? 'Reviewer is reading the deliverable…'
+            : 'Reviewer is reading the diff…',
+          spinning: true,
+        };
       return {
         kind: 'button',
-        label: 'Start build',
-        help: 'A coder agent implements the approved plan on a branch.',
+        label: task ? 'Start work' : 'Start build',
+        help: task
+          ? 'An agent produces the deliverable files per the approved plan.'
+          : 'A coder agent implements the approved plan on a branch.',
         action: 'build',
       };
     case 'SCANNING':
       return {
         kind: 'status',
-        text: 'Scanning for secrets and unsafe patterns…',
+        text: task
+          ? 'Scanning the deliverable for secrets…'
+          : 'Scanning for secrets and unsafe patterns…',
         spinning: true,
       };
     case 'AWAITING_MERGE_APPROVAL':
       return {
         kind: 'scrollButton',
         label: 'Review & approve ↓',
-        help: 'Inspect the diff and approve the merge with your passkey.',
+        help: task
+          ? 'Inspect the deliverable and approve delivery with your passkey.'
+          : 'Inspect the diff and approve the merge with your passkey.',
         target: 'gate-section',
       };
     case 'MERGED':
-      return { kind: 'done', text: 'Merged into your repository.' };
+      return {
+        kind: 'done',
+        text: task ? 'Delivered.' : 'Merged into your repository.',
+      };
     case 'FAILED':
       return { kind: 'done', text: 'This mission failed.' };
     case 'CANCELLED':

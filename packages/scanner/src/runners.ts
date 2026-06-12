@@ -120,6 +120,55 @@ export async function runGitleaks(
 }
 
 /**
+ * M6a: secrets scan over a plain directory (task-mission deliverables are not
+ * a git repository). Same SARIF contract, same exit-code semantics, same
+ * unconditional error-level mapping as the git mode.
+ */
+export async function runGitleaksDir(
+  dir: string,
+  options: { gitleaksBin?: string } = {},
+): Promise<SarifDocument> {
+  const bin =
+    options.gitleaksBin ?? process.env.LEGION_GITLEAKS_BIN ?? DEFAULT_GITLEAKS_BIN;
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'legion-gld-'));
+  const report = path.join(tmp, `${randomUUID()}.sarif`);
+  const args = [
+    'dir',
+    '--report-format', 'sarif',
+    '--report-path', report,
+    '--no-banner',
+    '--exit-code', '1',
+    dir,
+  ];
+  let stderr = '';
+  try {
+    const r = await exec(bin, args, { maxBuffer: 64 * 1024 * 1024 });
+    stderr = r.stderr;
+  } catch (e) {
+    const failure = e as ExecFailure;
+    stderr = failure.stderr ?? '';
+    if (failure.code !== 1) {
+      await rm(tmp, { recursive: true, force: true });
+      throw new ScannerCrashError(
+        'gitleaks',
+        failure.code ?? null,
+        tail(`${stderr}\n${failure.stdout ?? ''}`),
+      );
+    }
+    // exit 1 = leaks found; the SARIF report carries them
+  }
+  const sarif = await readSarif(report, 'gitleaks', stderr);
+  await rm(tmp, { recursive: true, force: true });
+  // a hardcoded secret is never a warning — force level error (M4 pin 4)
+  for (const run of sarif.runs) {
+    for (const result of run.results ?? []) {
+      result.level = 'error';
+    }
+  }
+  return sarif;
+}
+
+/**
  * Code-pattern scan of the workspace checkout. Exit 0 = ran (findings live
  * in the SARIF); anything else is a crash.
  */

@@ -17,10 +17,14 @@ export type {
 } from './orchestrator.js';
 export {
   buildCoderPrompt,
+  buildDeliverableReviewerPrompt,
   buildPlannerPrompt,
   buildReviewerPrompt,
   buildRevisionPrompt,
+  buildTaskPlannerPrompt,
+  buildTaskRevisionPrompt,
+  buildTaskWorkerPrompt,
 } from './prompt.js';
 export type { RejectionFeedback } from './prompt.js';
-export { executeMerge, reconcileMerges } from './merge.js';
-export type { MergeOutcome } from './merge.js';
+export { executeDelivery, executeMerge, reconcileMerges } from './merge.js';
+export type { DeliveryOutcome, MergeOutcome } from './merge.js';

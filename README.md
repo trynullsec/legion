@@ -354,6 +354,49 @@ verification. This is the pinned, honest exception to hardware: real protocol,
 software key store. **There are no verification bypass flags anywhere in the
 code, not even for tests.**
 
+## Task missions: accountable agent work beyond code (Milestone 6a)
+
+Legion's second mission kind. A `task` mission's deliverable is one or more
+**files** — research, writing, analysis — instead of a diff. The state machine
+and its transition table are **unchanged**; the stages adapt by kind, and the
+ledger stays canonical (`BUILD_*`/`MERGE_*` event names are kept — renaming
+events would be a ledger-compat break; the UI shows friendlier stage labels).
+
+- **Kind at the boundary** (migration 006):   `MISSION_CREATED` payloads carry
+  `kind: 'code' | 'task'` (existing events backfilled to `'code'`; a code
+  mission created without `kind` stores its payload unchanged and folding
+  defaults absent kind to `'code'`, so every pre-M6a ledger — and its tests —
+  is untouched).
+  zod enforces the discrimination: code **requires** `repoPath`, task
+  **forbids** it; optional `deliverTo` (absolute dir) is task-only, defaulting
+  to `~/.legion/deliveries/<missionId>/`.
+- **Planning**: the task planner gets the objective only — there is no clone.
+  Same Plan schema; `filesLikelyTouched` carries the expected deliverable
+  filenames. Same approval/rejection loop, same verbatim-feedback rule.
+- **Execution**: a `worker`-role agent runs in an isolated workdir and must
+  write its output files (md/txt/csv/json) into `deliverables/`. On exit the
+  orchestrator collects them into **one hash-sealed artifact** of type
+  `deliverable` — a single file as-is, multiple files as a tar — with the
+  per-file manifest (names + sha256) recorded in `BUILD_COMPLETED`. A clean
+  exit with an empty `deliverables/` fails the attempt (`EMPTY_DELIVERABLE`,
+  mirroring `EMPTY_DIFF`). The reviewer reads the deliverable against the
+  plan: same verdict contract, same max-2-cycles rule.
+- **Scanning — the pitch**: every deliverable is **gitleaks-scanned before any
+  human reads it** (`gitleaks dir` over the deliverables; semgrep is skipped
+  for non-code and the per-tool breakdown shows gitleaks alone). Same
+  threshold semantics, same SARIF artifact, same `SCAN_FAILED → BUILDING`
+  rework with the findings embedded in the next attempt's prompt. An agent
+  that pastes an API key into a "research summary" never reaches your eyes.
+- **The gate**: identical ceremony. The challenge binds
+  `{missionId, deliverableSha256, sarifSha256}` — both recomputed from disk at
+  issue *and* verify (T41 semantics). The board renders a deliverable preview
+  (markdown rendered, others mono; archives list each file) above the hashes.
+- **Delivery**: a verified approval copies the deliverable into `deliverTo`,
+  verifies the copy's hashes against the build-time manifest, and **only
+  then** emits `MERGE_APPROVED {approvalId, hashes, deliveredTo}` → MERGED.
+  Boot reconciliation detects a completed-but-unrecorded delivery by manifest
+  hashes in `deliverTo` and emits the event exactly once (T47 semantics).
+
 ## Tests
 
 | Suite | What it proves |
@@ -361,5 +404,5 @@ code, not even for tests.**
 | `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework |
 | `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
-| `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation) |
+| `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation); T48–T54 task missions (kind boundary, real deliverable production, gitleaks-on-deliverables, tamper-voiding, EMPTY_DELIVERABLE, tar delivery, reviewer loop) |
 | `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |

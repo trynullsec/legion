@@ -850,6 +850,93 @@ header .sub {
   word-break: break-word;
 }
 
+/* ---------- M6a: mission kinds (presentation only) ---------- */
+
+.kind-tag {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  border: 1px solid var(--hairline);
+  padding: 1px 7px;
+  color: var(--ink-dim);
+}
+.kind-tag.kind-task {
+  border-color: var(--ink-dim);
+  color: var(--ink);
+}
+
+.kind-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  grid-column: 1 / -1;
+}
+.kind-toggle .field-help {
+  margin-left: 6px;
+}
+
+.deliverable-preview {
+  border: 1px solid var(--hairline);
+  margin-bottom: 18px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.deliverable-file + .deliverable-file {
+  border-top: 1px solid var(--hairline);
+}
+.deliverable-name {
+  padding: 10px 14px 0;
+  color: var(--ink-faint);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.deliverable-mono {
+  padding: 10px 14px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-dim);
+}
+.md-body {
+  padding: 10px 14px 14px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink-dim);
+}
+.md-body p {
+  margin: 0 0 8px;
+}
+.md-body .md-h {
+  color: var(--ink);
+  font-family: var(--serif);
+  margin: 12px 0 6px;
+}
+.md-body .md-h1 {
+  font-size: 20px;
+}
+.md-body .md-h2 {
+  font-size: 17px;
+}
+.md-body .md-h3,
+.md-body .md-h4 {
+  font-size: 14px;
+}
+.md-body ul {
+  margin: 0 0 8px 18px;
+}
+.md-body pre {
+  background: var(--bg-raise);
+  border: 1px solid var(--hairline);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+  margin: 0 0 8px;
+}
+
 @media (max-width: 1100px) {
   .columns {
     grid-template-columns: 1fr;

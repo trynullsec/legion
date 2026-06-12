@@ -7,6 +7,7 @@ export {
 } from './machine.js';
 export {
   EVENT_TYPES,
+  MISSION_KINDS,
   MISSION_STATES,
   RISK_LEVELS,
   TERMINAL_STATES,
@@ -19,6 +20,7 @@ export type {
   EventType,
   FoldEvent,
   MissionCreationPayload,
+  MissionKind,
   MissionSnapshot,
   MissionStateName,
   RiskLevel,

@@ -37,12 +37,27 @@ export const RISK_LEVELS = ['low', 'medium', 'high'] as const;
 
 export type RiskLevel = (typeof RISK_LEVELS)[number];
 
+/**
+ * M6a: a mission's kind decides what its stages produce. 'code' missions
+ * deliver a diff into a git repository; 'task' missions deliver file
+ * artifacts (research, writing, analysis). Absent kind = 'code' (back-compat
+ * with every pre-M6a ledger).
+ */
+export const MISSION_KINDS = ['code', 'task'] as const;
+
+export type MissionKind = (typeof MISSION_KINDS)[number];
+
 /** Payload of MISSION_CREATED. Validated with zod at the API boundary; core trusts typed input. */
 export interface MissionCreationPayload {
   title: string;
   objective: string;
-  repoPath: string;
   riskLevel: RiskLevel;
+  /** Absent = 'code' (pre-M6a ledgers). */
+  kind?: MissionKind;
+  /** Required for kind=code; forbidden for kind=task (boundary-enforced). */
+  repoPath?: string;
+  /** kind=task only: delivery directory; default ~/.legion/deliveries/<missionId>/. */
+  deliverTo?: string;
 }
 
 /** The minimal shape core needs to fold a mission's event log. */
@@ -57,6 +72,10 @@ export interface MissionSnapshot {
   state: MissionStateName;
   title: string;
   objective: string;
-  repoPath: string;
+  kind: MissionKind;
+  /** null for task missions. */
+  repoPath: string | null;
+  /** null for code missions and task missions using the default. */
+  deliverTo: string | null;
   riskLevel: RiskLevel;
 }

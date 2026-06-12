@@ -6,10 +6,12 @@ import {
 import {
   approvalOptions,
   fetchApproval,
+  fetchDeliverable,
   isApproverRegistered,
   submitApprove,
   submitReject,
   type ApprovalInfo,
+  type DeliverablePreview,
 } from './api';
 import {
   ApiError,
@@ -30,6 +32,7 @@ import {
   type Artifact,
   type Mission,
   type MissionEvent,
+  type MissionKind,
   type MissionState,
   type Plan,
   type ReviewResult,
@@ -250,9 +253,11 @@ const COLUMNS: { label: string; states: MissionState[] }[] = [
 
 function NewMissionForm({ onCreated }: { onCreated: () => void }) {
   const [open, setOpen] = useState(false);
+  const [kind, setKind] = useState<MissionKind>('code');
   const [title, setTitle] = useState('');
   const [objective, setObjective] = useState('');
   const [repoPath, setRepoPath] = useState('');
+  const [deliverTo, setDeliverTo] = useState('');
   const [riskLevel, setRiskLevel] = useState<RiskLevel>('low');
   const [error, setError] = useState<unknown | null>(null);
   const [busy, setBusy] = useState(false);
@@ -262,10 +267,18 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
     setBusy(true);
     setError(null);
     try {
-      await postMission({ title, objective, repoPath, riskLevel });
+      await postMission({
+        title,
+        objective,
+        kind,
+        riskLevel,
+        ...(kind === 'code' ? { repoPath } : {}),
+        ...(kind === 'task' && deliverTo.trim() ? { deliverTo: deliverTo.trim() } : {}),
+      });
       setTitle('');
       setObjective('');
       setRepoPath('');
+      setDeliverTo('');
       setRiskLevel('low');
       onCreated();
     } catch (err) {
@@ -295,6 +308,29 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
           Close
         </button>
       </div>
+      <div className="kind-toggle" role="radiogroup" aria-label="mission kind">
+        <button
+          type="button"
+          className={`btn ${kind === 'code' ? 'btn-primary' : ''}`}
+          aria-pressed={kind === 'code'}
+          onClick={() => setKind('code')}
+        >
+          Code
+        </button>
+        <button
+          type="button"
+          className={`btn ${kind === 'task' ? 'btn-primary' : ''}`}
+          aria-pressed={kind === 'task'}
+          onClick={() => setKind('task')}
+        >
+          Task
+        </button>
+        <span className="field-help">
+          {kind === 'code'
+            ? 'Agents change code in a git repository; you approve the merge.'
+            : 'Agents produce a document or dataset; you approve the delivery.'}
+        </span>
+      </div>
       <label>
         title
         <input
@@ -313,21 +349,38 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
           required
         />
         <span className="field-help">
-          What should change, where, and what proves it worked — agents read
-          this verbatim
+          {kind === 'code'
+            ? 'What should change, where, and what proves it worked — agents read this verbatim'
+            : 'What to produce and what it must contain — agents read this verbatim'}
         </span>
       </label>
-      <label>
-        repo path
-        <input
-          value={repoPath}
-          onChange={(e) => setRepoPath(e.target.value)}
-          required
-        />
-        <span className="field-help">
-          Absolute path to a local git repository
-        </span>
-      </label>
+      {kind === 'code' && (
+        <label>
+          repo path
+          <input
+            value={repoPath}
+            onChange={(e) => setRepoPath(e.target.value)}
+            required
+          />
+          <span className="field-help">
+            Absolute path to a local git repository
+          </span>
+        </label>
+      )}
+      {kind === 'task' && (
+        <label>
+          deliver to <span className="mono small">(optional)</span>
+          <input
+            value={deliverTo}
+            onChange={(e) => setDeliverTo(e.target.value)}
+            placeholder="~/.legion/deliveries/<mission>/"
+          />
+          <span className="field-help">
+            Absolute directory where the approved deliverable lands — leave
+            empty for the default
+          </span>
+        </label>
+      )}
       <label>
         risk level
         <select
@@ -569,8 +622,12 @@ function BuildSection({ mission }: { mission: Mission }) {
   return (
     <section className="build">
       <Divider
-        label="Build"
-        hint="A coder agent implements the plan with real commits; a reviewer agent reads the diff before you ever see it."
+        label={mission.kind === 'task' ? 'Work' : 'Build'}
+        hint={
+          mission.kind === 'task'
+            ? 'An agent produces the deliverable files; a reviewer agent reads them against the plan before you ever see them.'
+            : 'A coder agent implements the plan with real commits; a reviewer agent reads the diff before you ever see it.'
+        }
       />
       <Notice error={error} />
 
@@ -611,8 +668,11 @@ function BuildSection({ mission }: { mission: Mission }) {
             >
               <span className="mono">{a.type}</span>
               <span className="mono small">
-                {a.stats.files} files +{a.stats.insertions} −{a.stats.deletions} ·{' '}
-                {a.stats.commits} commits
+                {a.type === 'diff'
+                  ? `${a.stats.files} files +${a.stats.insertions} −${a.stats.deletions} · ${a.stats.commits} commits`
+                  : a.type === 'deliverable'
+                    ? `${a.stats.files} files`
+                    : `${(a.stats as Record<string, number>).errors ?? 0} errors`}
               </span>
             </button>
           ))}
@@ -633,26 +693,131 @@ function BuildSection({ mission }: { mission: Mission }) {
   );
 }
 
-function MergedBanner({ missionId }: { missionId: string }) {
+function MergedBanner({ mission }: { mission: Mission }) {
   const [commit, setCommit] = useState<string | null>(null);
+  const [deliveredTo, setDeliveredTo] = useState<string | null>(null);
   useEffect(() => {
-    void fetchMission(missionId).then((d) => {
+    void fetchMission(mission.missionId).then((d) => {
       const merged = [...d.events].reverse().find((e) => e.type === 'MERGE_APPROVED');
       const mc = merged?.payload?.mergeCommit;
+      const dt = merged?.payload?.deliveredTo;
       setCommit(typeof mc === 'string' ? mc : null);
+      setDeliveredTo(typeof dt === 'string' ? dt : null);
     });
-  }, [missionId]);
+  }, [mission.missionId]);
+  const task = mission.kind === 'task';
   return (
     <section className="approval">
-      <Divider label="Merged" />
+      <Divider label={task ? 'Delivered' : 'Merged'} />
       <div className="approval-box merged-box">
         <p className="mono small">
-          This mission was approved with a passkey and merged into your
-          repository.
+          {task
+            ? 'This deliverable was approved with a passkey and copied to its destination.'
+            : 'This mission was approved with a passkey and merged into your repository.'}
         </p>
         {commit && <HashRow label="merge commit" value={commit} />}
+        {deliveredTo && <HashRow label="delivered to" value={deliveredTo} />}
       </div>
     </section>
+  );
+}
+
+/**
+ * M6a (pin 5): deliverable preview at the gate. Markdown files get a light
+ * display rendering; everything else is mono text. Archives list every file
+ * with a per-file preview. Display-only.
+ */
+function renderMarkdown(md: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const lines = md.split('\n');
+  let listItems: string[] = [];
+  let inCode = false;
+  let codeLines: string[] = [];
+
+  const flushList = (key: string) => {
+    if (listItems.length === 0) return;
+    out.push(
+      <ul key={key}>
+        {listItems.map((li, i) => (
+          <li key={i}>{li}</li>
+        ))}
+      </ul>,
+    );
+    listItems = [];
+  };
+
+  lines.forEach((line, i) => {
+    if (line.startsWith('```')) {
+      if (inCode) {
+        out.push(<pre key={`c${i}`}>{codeLines.join('\n')}</pre>);
+        codeLines = [];
+      }
+      inCode = !inCode;
+      return;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      return;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      flushList(`l${i}`);
+      const level = h[1]!.length;
+      out.push(
+        <p key={i} className={`md-h md-h${level}`}>
+          {h[2]}
+        </p>,
+      );
+      return;
+    }
+    if (/^\s*[-*]\s+/.test(line)) {
+      listItems.push(line.replace(/^\s*[-*]\s+/, ''));
+      return;
+    }
+    flushList(`l${i}`);
+    if (line.trim().length > 0) {
+      out.push(<p key={i}>{line}</p>);
+    }
+  });
+  flushList('tail');
+  if (codeLines.length > 0) out.push(<pre key="ctail">{codeLines.join('\n')}</pre>);
+  return out;
+}
+
+function DeliverablePreviewBox({ missionId }: { missionId: string }) {
+  const [preview, setPreview] = useState<DeliverablePreview | null>(null);
+  const [error, setError] = useState<unknown | null>(null);
+
+  useEffect(() => {
+    fetchDeliverable(missionId)
+      .then(setPreview)
+      .catch((e) => setError(e));
+  }, [missionId]);
+
+  if (error) return <Notice error={error} />;
+  if (!preview) return null;
+
+  return (
+    <div className="deliverable-preview">
+      {preview.archive && (
+        <p className="mono small">
+          {preview.files.length} files in this deliverable:
+        </p>
+      )}
+      {preview.files.map((f) => (
+        <div className="deliverable-file" key={f.name}>
+          <p className="mono small deliverable-name">
+            {f.name}
+            {f.truncated ? ' (preview truncated)' : ''}
+          </p>
+          {f.name.endsWith('.md') ? (
+            <div className="md-body">{renderMarkdown(f.content)}</div>
+          ) : (
+            <pre className="deliverable-mono">{f.content}</pre>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -691,6 +856,7 @@ function ApprovalPanel({ mission }: { mission: Mission }) {
       if (decision === 'approve') {
         const r = await submitApprove(mission.missionId, assertion);
         if (r.error) setError(new ApiError(409, r.error, JSON.stringify(r)));
+        else if (r.delivered) setStatus(`Delivered to ${r.deliveredTo}.`);
         else setStatus(`Merged — commit ${r.mergeCommit?.slice(0, 10)}.`);
       } else {
         await submitReject(mission.missionId, assertion, reason.trim());
@@ -709,11 +875,16 @@ function ApprovalPanel({ mission }: { mission: Mission }) {
     }
   };
 
+  const task = mission.kind === 'task';
   return (
     <section className="approval" id="gate-section">
       <Divider
-        label="Human Gate — Merge Approval"
-        hint="Your passkey signature approves these exact bytes."
+        label={task ? 'Human Gate — Delivery Approval' : 'Human Gate — Merge Approval'}
+        hint={
+          task
+            ? 'Your passkey signature approves this exact deliverable.'
+            : 'Your passkey signature approves these exact bytes.'
+        }
       />
       <Notice error={error} />
       {status && <p className="mono small gate-status">{status}</p>}
@@ -733,9 +904,13 @@ function ApprovalPanel({ mission }: { mission: Mission }) {
 
       {registered && (
         <div className="approval-box approval-hero">
+          {task && <DeliverablePreviewBox missionId={mission.missionId} />}
           {info?.hashes && (
             <div className="hash-block">
-              <HashRow label="diff sha256" value={info.hashes.diff} />
+              <HashRow
+                label={task ? 'deliverable sha256' : 'diff sha256'}
+                value={info.hashes.diff}
+              />
               <HashRow label="sarif sha256" value={info.hashes.sarif} />
             </div>
           )}
@@ -1067,8 +1242,9 @@ function NextActionBar({
     hasLivePlanner: workers.some((w) => w.role === 'planner' && isLive(w)),
     hasLiveCoder: workers.some((w) => w.role === 'coder' && isLive(w)),
     hasLiveReviewer: workers.some((w) => w.role === 'reviewer' && isLive(w)),
+    hasLiveTaskWorker: workers.some((w) => w.role === 'worker' && isLive(w)),
   };
-  const action = nextAction(mission.state, live);
+  const action = nextAction(mission.state, live, mission.kind);
 
   const run = async (kind: 'plan' | 'build') => {
     setBusy(true);
@@ -1084,11 +1260,12 @@ function NextActionBar({
     }
   };
 
-  const mergeCommit =
+  const mergedPayload =
     mission.state === 'MERGED'
-      ? ([...events].reverse().find((e) => e.type === 'MERGE_APPROVED')
-          ?.payload?.mergeCommit as string | undefined)
+      ? [...events].reverse().find((e) => e.type === 'MERGE_APPROVED')?.payload
       : undefined;
+  const mergeCommit = mergedPayload?.mergeCommit as string | undefined;
+  const deliveredTo = mergedPayload?.deliveredTo as string | undefined;
 
   return (
     <div className="action-bar">
@@ -1132,6 +1309,11 @@ function NextActionBar({
               className="action-commit"
               title={mergeCommit}
             >{` commit ${mergeCommit.slice(0, 10)}`}</span>
+          )}
+          {deliveredTo && (
+            <span className="action-commit" title={deliveredTo}>
+              {` → ${deliveredTo}`}
+            </span>
           )}
         </span>
       )}
@@ -1194,8 +1376,13 @@ function MissionDetail({
             <span className={`state state-${mission.state}`}>
               {mission.state}
             </span>
+            <span className={`kind-tag kind-${mission.kind}`}>{mission.kind}</span>
             <span className="mono">risk: {mission.riskLevel}</span>
-            <span className="mono">{mission.repoPath}</span>
+            <span className="mono">
+              {mission.kind === 'task'
+                ? `deliver to: ${mission.deliverTo ?? 'default (~/.legion/deliveries)'}`
+                : mission.repoPath}
+            </span>
           </p>
           <p className="objective">{mission.objective}</p>
           <Divider
@@ -1229,9 +1416,7 @@ function MissionDetail({
           <BuildSection mission={mission} />
           <ScanSection mission={mission} />
           <ApprovalPanel mission={mission} />
-          {mission.state === 'MERGED' && (
-            <MergedBanner missionId={mission.missionId} />
-          )}
+          {mission.state === 'MERGED' && <MergedBanner mission={mission} />}
           <WorkersSection missionId={missionId} />
         </>
       )}
@@ -1314,7 +1499,8 @@ export default function App() {
                         {m.state}
                       </span>
                       <span className="mono small">
-                        risk {m.riskLevel} · {m.eventCount} events
+                        <span className={`kind-tag kind-${m.kind}`}>{m.kind}</span>
+                        {' '}· risk {m.riskLevel} · {m.eventCount} events
                       </span>
                     </button>
                   ))}

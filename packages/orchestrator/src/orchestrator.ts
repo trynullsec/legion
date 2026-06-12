@@ -31,6 +31,7 @@ import {
   listFindings,
   mergeSarif,
   runGitleaks,
+  runGitleaksDir,
   runSemgrep,
   ScannerCrashError,
   verdict,
@@ -41,12 +42,22 @@ import type { WorkerSupervisor } from '@legion/runtime';
 import type { Pool } from 'pg';
 import {
   buildCoderPrompt,
+  buildDeliverableReviewerPrompt,
   buildPlannerPrompt,
   buildReviewerPrompt,
   buildRevisionPrompt,
+  buildTaskPlannerPrompt,
+  buildTaskRevisionPrompt,
+  buildTaskWorkerPrompt,
   type RejectionFeedback,
 } from './prompt.js';
-import { executeMerge, reconcileMerges, type MergeOutcome } from './merge.js';
+import {
+  executeDelivery,
+  executeMerge,
+  reconcileMerges,
+  type DeliveryOutcome,
+  type MergeOutcome,
+} from './merge.js';
 
 const exec = promisify(execFile);
 
@@ -157,6 +168,8 @@ export interface OrchestratorOptions {
   buildsRoot?: string;
   /** Root for diff artifacts; default ~/.legion/artifacts. */
   artifactsRoot?: string;
+  /** M6a: default delivery root for task missions; default ~/.legion/deliveries. */
+  deliveriesRoot?: string;
 }
 
 /**
@@ -174,6 +187,7 @@ export class Orchestrator {
   private readonly workdirRoot: string;
   private readonly buildsRoot: string;
   private readonly artifactsRoot: string;
+  private readonly deliveriesRoot: string;
   private readonly activeBuilds = new Set<string>();
   private readonly activeScans = new Set<string>();
 
@@ -203,6 +217,8 @@ export class Orchestrator {
       options.buildsRoot ?? path.join(os.homedir(), '.legion', 'builds');
     this.artifactsRoot =
       options.artifactsRoot ?? path.join(os.homedir(), '.legion', 'artifacts');
+    this.deliveriesRoot =
+      options.deliveriesRoot ?? path.join(os.homedir(), '.legion', 'deliveries');
   }
 
   /**
@@ -236,35 +252,43 @@ export class Orchestrator {
       await appendEvent(this.pool, missionId, 'PLANNING_STARTED');
     }
 
+    const feedback = await this.rejectionFeedback(missionId);
     const prompt =
       options.taskOverride ??
-      buildPlannerPrompt(mission, await this.rejectionFeedback(missionId));
+      (mission.kind === 'task'
+        ? buildTaskPlannerPrompt(mission, feedback)
+        : buildPlannerPrompt(mission, feedback));
 
-    const spawned = await this.spawnPlanner(missionId, mission.repoPath, prompt);
+    const spawned = await this.spawnPlanner(missionId, mission, prompt);
     const settled = this.finishPlanning(
-      missionId, mission.repoPath, spawned.workerId, spawned.workdir, prompt, 1,
+      missionId, mission, spawned.workerId, spawned.workdir, prompt, 1,
     );
     return { workerId: spawned.workerId, settled };
   }
 
   /**
-   * Clone the mission repo into a fresh isolated workdir and spawn a planner.
-   * The planner NEVER touches the user's repository — file:// shallow clone.
+   * Spawn a planner in a fresh isolated workdir. Code missions get a shallow
+   * file:// clone (the planner NEVER touches the user's repository); task
+   * missions get an empty directory — there is nothing to clone (pin 2).
    */
   private async spawnPlanner(
     missionId: string,
-    repoPath: string,
+    mission: MissionRecord,
     prompt: string,
   ): Promise<{ workerId: string; workdir: string }> {
     const workdir = path.join(this.workdirRoot, missionId, `planner-${randomUUID()}`);
     await mkdir(path.dirname(workdir), { recursive: true });
-    await exec('git', [
-      'clone',
-      '--depth',
-      '1',
-      `file://${path.resolve(repoPath)}`,
-      workdir,
-    ]);
+    if (mission.kind === 'task') {
+      await mkdir(workdir, { recursive: true });
+    } else {
+      await exec('git', [
+        'clone',
+        '--depth',
+        '1',
+        `file://${path.resolve(mission.repoPath!)}`,
+        workdir,
+      ]);
+    }
 
     const workerId = await this.supervisor.startWorker({
       missionId,
@@ -307,7 +331,7 @@ export class Orchestrator {
 
   private async finishPlanning(
     missionId: string,
-    repoPath: string,
+    mission: MissionRecord,
     workerId: string,
     workdir: string,
     prompt: string,
@@ -340,9 +364,9 @@ export class Orchestrator {
       // cleanly without writing plan.json. The failed run keeps its
       // PLAN_INVALID record; one more real planner gets a chance.
       if (run < MAX_PLANNER_RUNS) {
-        const next = await this.spawnPlanner(missionId, repoPath, prompt);
+        const next = await this.spawnPlanner(missionId, mission, prompt);
         return this.finishPlanning(
-          missionId, repoPath, next.workerId, next.workdir, prompt, run + 1,
+          missionId, mission, next.workerId, next.workdir, prompt, run + 1,
         );
       }
       return { kind: 'INVALID', issues };
@@ -409,7 +433,7 @@ export class Orchestrator {
     const workers = await listMissionWorkers(this.pool, missionId);
     const liveBuilder = workers.find(
       (w) =>
-        (w.role === 'coder' || w.role === 'reviewer') &&
+        (w.role === 'coder' || w.role === 'reviewer' || w.role === 'worker') &&
         (w.status === 'STARTING' || w.status === 'RUNNING'),
     );
     if (liveBuilder) throw new BuildInProgressError(missionId);
@@ -424,11 +448,18 @@ export class Orchestrator {
     );
     const attempt = existing.length + 1;
     const attemptDir = path.join(missionBuilds, `attempt-${attempt}`);
-    const repoDir = path.join(attemptDir, 'repo');
     await mkdir(path.join(attemptDir, '.tmp'), { recursive: true });
 
+    // M6a: task missions execute in an isolated workdir with a deliverables/
+    // contract instead of a git clone (pin 3)
+    if (mission.kind === 'task') {
+      return this.startTaskBuild({ missionId, mission, plan, overrides, attempt, attemptDir });
+    }
+
+    const repoDir = path.join(attemptDir, 'repo');
+
     // full local clone; the user's repo is never written
-    await exec('git', ['clone', `file://${path.resolve(mission.repoPath)}`, repoDir]);
+    await exec('git', ['clone', `file://${path.resolve(mission.repoPath!)}`, repoDir]);
     // sever the link back to the user's repo so a push is impossible
     await exec('git', ['-C', repoDir, 'remote', 'remove', 'origin']);
     const baseSha = (
@@ -441,19 +472,7 @@ export class Orchestrator {
     // recorded for the scan stage: the diff/scan base of this attempt
     await writeFile(path.join(attemptDir, 'base.sha'), `${baseSha}\n`);
 
-    // Rework feedback precedence: a merge rejection (M5) or scan failure (M4)
-    // is more recent than any review summary (M3). The next coder prompt
-    // carries whichever triggered this build.
-    const mergeRejection = await this.lastMergeRejectionReason(missionId);
-    const scanFindings = await this.lastScanFailureFindings(missionId);
-    let priorFailure: string | null;
-    if (mergeRejection !== null) {
-      priorFailure = `the human reviewer rejected the previous merge. Reason: ${mergeRejection}`;
-    } else if (scanFindings !== null) {
-      priorFailure = `the previous build failed the security scan. Fix these findings:\n${scanFindings}`;
-    } else {
-      priorFailure = await this.lastAttemptFailureSummary(missionId);
-    }
+    const priorFailure = await this.reworkFeedback(missionId);
 
     this.activeBuilds.add(missionId);
     try {
@@ -488,20 +507,21 @@ export class Orchestrator {
 
   private async spawnBuildWorker(
     missionId: string,
-    role: 'coder' | 'reviewer',
+    role: 'coder' | 'reviewer' | 'worker',
     task: string,
     workdir: string,
     extraEnv?: Record<string, string>,
   ): Promise<string> {
+    const doing = role === 'coder' || role === 'worker';
     const workerId = await this.supervisor.startWorker({
       missionId,
       role,
       task,
       workdir,
       extraEnv,
-      model: role === 'coder' ? this.coderModel : this.reviewerModel,
+      model: doing ? this.coderModel : this.reviewerModel,
       // implementing a plan takes far more tool iterations than a review
-      maxTurns: role === 'coder' ? 40 : undefined,
+      maxTurns: doing ? 40 : undefined,
     });
     await appendWorkerEvent(this.pool, {
       missionId,
@@ -761,6 +781,20 @@ export class Orchestrator {
       throw new ScanStateError(missionId, 'SCANNING (no build workspace found)');
     }
     const attemptDir = path.join(missionBuilds, `attempt-${latest}`);
+
+    // M6a (pin 4): task missions scan the deliverables with gitleaks only
+    if (result.mission.kind === 'task') {
+      const deliverablesDir = path.join(attemptDir, 'work', 'deliverables');
+      this.activeScans.add(missionId);
+      await appendEvent(this.pool, missionId, 'SCAN_STARTED', { attempt: latest });
+      const settled = this.runTaskScan(missionId, deliverablesDir, overrides).finally(
+        () => {
+          this.activeScans.delete(missionId);
+        },
+      );
+      return { settled };
+    }
+
     const repoDir = path.join(attemptDir, 'repo');
     const baseSha = (await readFile(path.join(attemptDir, 'base.sha'), 'utf8')).trim();
 
@@ -773,6 +807,79 @@ export class Orchestrator {
       },
     );
     return { settled };
+  }
+
+  /**
+   * M6a (pin 4): gitleaks-only scan over a task mission's deliverables.
+   * semgrep is skipped for non-code; the per-tool breakdown shows gitleaks
+   * alone. Threshold semantics, SARIF artifact, and SCAN_FAILED→BUILDING
+   * rework are identical to the code path.
+   */
+  private async runTaskScan(
+    missionId: string,
+    deliverablesDir: string,
+    overrides: ScanOverrides,
+  ): Promise<ScanOutcome> {
+    const failLevel: FailLevel =
+      overrides.failLevel ??
+      (process.env.LEGION_SCAN_FAIL_LEVEL === 'warning' ? 'warning' : 'error');
+
+    let gitleaksDoc: SarifDocument;
+    try {
+      gitleaksDoc = await runGitleaksDir(deliverablesDir, {
+        gitleaksBin: overrides.gitleaksBin,
+      });
+    } catch (e) {
+      const tool = e instanceof ScannerCrashError ? e.tool : 'scanner';
+      const stderrTail =
+        e instanceof ScannerCrashError ? e.stderrTail : String(e);
+      await insertScanAttempt(this.pool, {
+        missionId,
+        status: 'ATTEMPT_FAILED',
+        stderrTail: `${tool}: ${stderrTail}`.slice(-4000),
+      });
+      return { kind: 'ATTEMPT_FAILED', tool, error: stderrTail };
+    }
+
+    const merged = mergeSarif([gitleaksDoc]);
+    const counts = countFindings(merged);
+    const toolBreakdown = {
+      gitleaks: countFindings(gitleaksDoc),
+    };
+
+    const artifactId = randomUUID();
+    const dir = path.join(this.artifactsRoot, missionId);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `${artifactId}.sarif`);
+    const body = JSON.stringify(merged, null, 2);
+    await writeFile(filePath, body);
+    await insertArtifact(this.pool, {
+      id: artifactId,
+      missionId,
+      type: 'sarif',
+      path: filePath,
+      sha256: createHash('sha256').update(body).digest('hex'),
+      stats: { ...counts },
+    });
+
+    const passed = verdict(counts, failLevel) === 'pass';
+    await insertScanAttempt(this.pool, {
+      missionId,
+      status: passed ? 'PASSED' : 'FAILED',
+      counts,
+      toolBreakdown,
+      sarifArtifactId: artifactId,
+    });
+    await appendEvent(
+      this.pool,
+      missionId,
+      passed ? 'SCAN_PASSED' : 'SCAN_FAILED',
+      { sarifArtifactId: artifactId, counts },
+    );
+
+    return passed
+      ? { kind: 'PASSED', sarifArtifactId: artifactId, counts }
+      : { kind: 'FAILED', sarifArtifactId: artifactId, counts };
   }
 
   private async runScan(
@@ -855,6 +962,287 @@ export class Orchestrator {
   // M5: merge execution
   // ====================================================================
 
+  /**
+   * Rework feedback precedence: a merge rejection (M5) or scan failure (M4)
+   * is more recent than any review summary (M3). The next attempt's prompt
+   * carries whichever triggered this build. Shared by code and task paths.
+   */
+  private async reworkFeedback(missionId: string): Promise<string | null> {
+    const mergeRejection = await this.lastMergeRejectionReason(missionId);
+    if (mergeRejection !== null) {
+      return `the human reviewer rejected the previous merge. Reason: ${mergeRejection}`;
+    }
+    const scanFindings = await this.lastScanFailureFindings(missionId);
+    if (scanFindings !== null) {
+      return `the previous build failed the security scan. Fix these findings:\n${scanFindings}`;
+    }
+    return this.lastAttemptFailureSummary(missionId);
+  }
+
+  // ====================================================================
+  // M6a: task missions — deliverable production (pin 3)
+  // ====================================================================
+
+  private async startTaskBuild(ctx: {
+    missionId: string;
+    mission: MissionRecord;
+    plan: Plan;
+    overrides: BuildOverrides;
+    attempt: number;
+    attemptDir: string;
+  }): Promise<{ attempt: number; coderWorkerId: string; settled: Promise<BuildOutcome> }> {
+    const { missionId, mission, plan, overrides, attempt, attemptDir } = ctx;
+
+    const workDir = path.join(attemptDir, 'work');
+    await mkdir(path.join(workDir, 'deliverables'), { recursive: true });
+
+    const priorFailure = await this.reworkFeedback(missionId);
+
+    this.activeBuilds.add(missionId);
+    try {
+      await appendEvent(this.pool, missionId, 'BUILD_STARTED', { attempt });
+
+      const workerEnv = {
+        HOME: attemptDir, // hermes state lands outside the deliverables tree
+        TMPDIR: path.join(attemptDir, '.tmp'),
+      };
+      const task =
+        overrides.coderTaskOverride ??
+        buildTaskWorkerPrompt(mission, plan, priorFailure);
+      const workerId = await this.spawnBuildWorker(
+        missionId, 'worker', task, workDir, workerEnv,
+      );
+
+      const settled = this.runTaskBuildAttempt({
+        missionId, mission, plan, overrides,
+        attempt, attemptDir, workDir,
+        firstWorkerId: workerId, workerEnv,
+      }).finally(() => {
+        this.activeBuilds.delete(missionId);
+      });
+
+      return { attempt, coderWorkerId: workerId, settled };
+    } catch (e) {
+      this.activeBuilds.delete(missionId);
+      throw e;
+    }
+  }
+
+  /** Every regular file under deliverables/, with content hashes. */
+  private async collectDeliverables(
+    workDir: string,
+  ): Promise<{ name: string; absPath: string; sha256: string }[]> {
+    const root = path.join(workDir, 'deliverables');
+    const entries = await readdir(root, { recursive: true, withFileTypes: true });
+    const files: { name: string; absPath: string; sha256: string }[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const absPath = path.join(entry.parentPath ?? root, entry.name);
+      const name = path.relative(root, absPath);
+      const content = await readFile(absPath);
+      files.push({
+        name,
+        absPath,
+        sha256: createHash('sha256').update(content).digest('hex'),
+      });
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    return files;
+  }
+
+  private async runTaskBuildAttempt(ctx: {
+    missionId: string;
+    mission: MissionRecord;
+    plan: Plan;
+    overrides: BuildOverrides;
+    attempt: number;
+    attemptDir: string;
+    workDir: string;
+    firstWorkerId: string;
+    workerEnv: Record<string, string>;
+  }): Promise<BuildOutcome> {
+    const { missionId, mission, plan, overrides, attempt, attemptDir, workDir } = ctx;
+
+    let lastWorkerId = ctx.firstWorkerId;
+    let review: Review | null = null;
+
+    const fail = async (reason: string): Promise<BuildOutcome> => {
+      await appendWorkerEvent(this.pool, {
+        missionId,
+        workerId: lastWorkerId,
+        type: 'BUILD_ATTEMPT_FAILED',
+        payload: {
+          attempt,
+          reason,
+          ...(review ? { reviewSummary: review.summary } : {}),
+        },
+      });
+      return { kind: 'ATTEMPT_FAILED', reason };
+    };
+
+    const MAX_WORKER_CYCLES = 2;
+    for (let cycle = 1; cycle <= MAX_WORKER_CYCLES; cycle++) {
+      let workerId = ctx.firstWorkerId;
+      if (cycle > 1) {
+        const task =
+          overrides.coderRevisionTaskOverride ??
+          buildTaskRevisionPrompt(mission, plan, review!.comments, review!.summary);
+        workerId = await this.spawnBuildWorker(
+          missionId, 'worker', task, workDir, ctx.workerEnv,
+        );
+      }
+      lastWorkerId = workerId;
+
+      await this.waitForWorker(workerId);
+      const worker = await getWorkerRecord(this.pool, workerId);
+      if (worker?.status !== 'EXITED') {
+        return fail(`WORKER_${worker?.status ?? 'UNKNOWN'}`);
+      }
+
+      // A worker that exits cleanly without producing files made nothing
+      // reviewable — fail fast (EMPTY_DELIVERABLE mirrors EMPTY_DIFF).
+      const files = await this.collectDeliverables(workDir);
+      if (files.length === 0) {
+        return fail('EMPTY_DELIVERABLE');
+      }
+
+      const contents = await Promise.all(
+        files.map(async (f) => ({
+          name: f.name,
+          content: await readFile(f.absPath, 'utf8'),
+        })),
+      );
+      const reviewerTask =
+        overrides.reviewerTaskOverrides?.[cycle - 1] ??
+        buildDeliverableReviewerPrompt(plan, contents);
+
+      // Same deterministic reviewer retry as the code path: a reviewer
+      // occasionally answers in chat instead of writing review.json.
+      let parsed:
+        | { ok: true; review: Review }
+        | { ok: false; issues: unknown[] }
+        | null = null;
+      const MAX_REVIEWER_RUNS = 2;
+      for (let run = 1; run <= MAX_REVIEWER_RUNS; run++) {
+        const reviewDir = path.join(
+          attemptDir,
+          `review-${cycle}${run > 1 ? `-retry${run - 1}` : ''}`,
+        );
+        await mkdir(reviewDir, { recursive: true });
+        const reviewerId = await this.spawnBuildWorker(
+          missionId, 'reviewer', reviewerTask, reviewDir,
+        );
+        lastWorkerId = reviewerId;
+
+        await this.waitForWorker(reviewerId);
+        const reviewer = await getWorkerRecord(this.pool, reviewerId);
+        if (reviewer?.status !== 'EXITED') {
+          return fail(`REVIEWER_${reviewer?.status ?? 'UNKNOWN'}`);
+        }
+
+        parsed = await this.readReview(path.join(reviewDir, 'review.json'));
+        if (parsed.ok) {
+          review = parsed.review;
+          await appendWorkerEvent(this.pool, {
+            missionId,
+            workerId: reviewerId,
+            type: 'REVIEW_RESULT',
+            payload: { ...review, cycle },
+          });
+          break;
+        }
+        await appendWorkerEvent(this.pool, {
+          missionId,
+          workerId: reviewerId,
+          type: 'REVIEW_INVALID',
+          payload: { issues: parsed.issues, run },
+        });
+      }
+      if (!parsed?.ok || !review) {
+        return fail('REVIEW_INVALID');
+      }
+
+      if (review.verdict === 'approve') {
+        const artifactId = await this.publishDeliverableArtifact(
+          missionId, workDir, files, review.summary,
+        );
+        return { kind: 'COMPLETED', artifactId };
+      }
+    }
+
+    return fail('REVIEW_EXHAUSTED');
+  }
+
+  /**
+   * Collect deliverables/ into ONE hash-sealed artifact (pin 3): a single
+   * file is stored as-is; multiple files become a tar. Per-file hashes ride
+   * in the BUILD_COMPLETED payload so delivery can verify the unpacked copy.
+   */
+  private async publishDeliverableArtifact(
+    missionId: string,
+    workDir: string,
+    files: { name: string; absPath: string; sha256: string }[],
+    reviewSummary: string,
+  ): Promise<string> {
+    const artifactId = randomUUID();
+    const dir = path.join(this.artifactsRoot, missionId);
+    await mkdir(dir, { recursive: true });
+
+    const archive = files.length > 1;
+    let filePath: string;
+    let body: Buffer;
+    if (archive) {
+      filePath = path.join(dir, `${artifactId}.tar`);
+      await exec('tar', [
+        '-cf', filePath,
+        '-C', path.join(workDir, 'deliverables'),
+        ...files.map((f) => f.name),
+      ]);
+      body = await readFile(filePath);
+    } else {
+      const only = files[0]!;
+      filePath = path.join(dir, `${artifactId}${path.extname(only.name) || '.out'}`);
+      body = await readFile(only.absPath);
+      await writeFile(filePath, body);
+    }
+    const sha256 = createHash('sha256').update(body).digest('hex');
+
+    const stats = {
+      files: files.length,
+      bytes: body.byteLength,
+    };
+    await insertArtifact(this.pool, {
+      id: artifactId,
+      missionId,
+      type: 'deliverable',
+      path: filePath,
+      sha256,
+      stats,
+    });
+
+    // mission_events carry the artifact reference + file manifest, never bodies
+    await appendEvent(this.pool, missionId, 'BUILD_COMPLETED', {
+      artifactId,
+      sha256,
+      stats,
+      reviewSummary,
+      deliverable: {
+        archive,
+        files: files.map((f) => ({ name: f.name, sha256: f.sha256 })),
+      },
+    });
+
+    try {
+      const { settled } = await this.startScan(missionId);
+      void settled.catch((e) =>
+        console.error(`auto-scan for ${missionId} failed:`, e),
+      );
+    } catch (e) {
+      console.error(`auto-scan for ${missionId} could not start:`, e);
+    }
+    return artifactId;
+  }
+
   /** Run the merge after a verified approval. Consumed by the daemon. */
   async mergeMission(missionId: string, approvalId: string): Promise<MergeOutcome> {
     return executeMerge(this.pool, {
@@ -864,9 +1252,21 @@ export class Orchestrator {
     });
   }
 
-  /** Boot-time crash reconciliation for merges (pin 5d). */
+  /** M6a (pin 6): run the delivery after a verified approval (task missions). */
+  async deliverMission(missionId: string, approvalId: string): Promise<DeliveryOutcome> {
+    return executeDelivery(this.pool, {
+      missionId,
+      approvalId,
+      deliveriesRoot: this.deliveriesRoot,
+    });
+  }
+
+  /** Boot-time crash reconciliation for merges and deliveries (pin 5d / M6a pin 6). */
   async reconcileMerges(): Promise<string[]> {
-    return reconcileMerges(this.pool, { buildsRoot: this.buildsRoot });
+    return reconcileMerges(this.pool, {
+      buildsRoot: this.buildsRoot,
+      deliveriesRoot: this.deliveriesRoot,
+    });
   }
 
   /** Reason of the latest signed merge rejection, if it triggered this build. */
