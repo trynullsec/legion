@@ -420,6 +420,53 @@ On a low-risk mission a human still disposes — by cancelling, or by letting
 the work reach the merge gate and rejecting there with a signed ceremony
 (the rework loop carries the reason as always).
 
+## Open missions: read-only web research (Milestone 6d)
+
+The everything-agent's first capability, scoped **read-only**. An `open`
+mission is a free-flowing research agent: it searches the web, fetches pages,
+and writes a **cited markdown report** as its deliverable. It cannot write,
+send, spend, or act — those are later milestones, behind capability scoping
+and the gate.
+
+- **Pipeline**: EXECUTE → deliverable → gitleaks scan → gate. There is no
+  plan gate (riskLevel is forced to `open-readonly`; a user-sent level is
+  ignored **with a recorded note**), no build, no diff, no code scan. The
+  state machine is unchanged — the orchestrator emits the synthetic
+  `PLANNING_STARTED → PLAN_PROPOSED → PLAN_APPROVED` sequence with
+  `policy: 'open-readonly'` in the ledger, then `BUILD_STARTED`/`BUILD_COMPLETED`
+  around the worker (pin: ledger event names stay canonical).
+- **Tools — an explicit allowlist**: the open worker's toolset is exactly
+  `web_search(query)` and `web_extract(urls)` (the vendored runtime's name
+  for *web_fetch*: url → readable text). Nothing else is reachable — no
+  shell, no file tools, no messaging. The agent cannot even write its own
+  report: the **launcher** (trusted Legion code) seals the agent's final
+  message as `deliverables/report.md`, the only write the worker process
+  performs.
+- **Search provider (pinned)**: Tavily — one key drives both search and
+  extract in the vendored runtime. Configure in `.env`:
+  `LEGION_SEARCH_PROVIDER=tavily` (the only supported value in v0.1) and
+  `LEGION_SEARCH_API_KEY=<your tavily key>`.
+- **Citations required**: the worker must ground claims in fetched sources
+  and cite URLs; the reviewer (reused from task missions) flags uncited
+  claims and rejects a report with no sources at all.
+- **The gate stays**: the deliverable is hash-sealed, gitleaks-scanned (an
+  agent can paste a fetched secret into a report), and the same passkey
+  ceremony binds the deliverable hash. Even read-only output is signed
+  before it is "official."
+
+### Open mission threat model
+
+Read-only web tools **can be prompt-injected by fetched content** — a
+malicious page can tell the agent to lie, omit, or mis-cite. The blast
+radius is a **wrong deliverable, not host compromise**: the worker cannot
+write outside its workdir (no shell, no file tools; the launcher writes only
+`deliverables/report.md`), cannot send anything anywhere, and cannot spend.
+Its environment is the same allowlist as every worker (no `DATABASE_URL`,
+redirected `HOME`) — asserted from inside a real worker by the test suite.
+And the wrong deliverable still faces the reviewer, the secrets scan, and
+your passkey before it is delivered. Consequential tools (write/send/spend)
+are gated and intentionally absent from this milestone.
+
 ## Scheduled missions (Milestone 6c)
 
 Recurring work runs unattended — nightly audits, weekly reports — and only

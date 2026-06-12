@@ -202,10 +202,54 @@ export type NextAction =
 export function nextAction(
   state: string,
   live: LiveWorkerInfo,
-  kind: 'code' | 'task' = 'code',
-  riskLevel: 'low' | 'medium' | 'high' = 'medium',
+  kind: 'code' | 'task' | 'open' = 'code',
+  riskLevel: 'low' | 'medium' | 'high' | 'open-readonly' = 'medium',
 ): NextAction {
   const task = kind === 'task';
+  // M6d: open missions collapse planning/building into one EXECUTE — the
+  // operator sees research-flavored guidance until the gate.
+  if (kind === 'open') {
+    switch (state) {
+      case 'DRAFT':
+        return {
+          kind: 'button',
+          label: 'Start research',
+          help: 'A read-only agent searches the web and writes a cited report.',
+          action: 'plan',
+        };
+      case 'PLANNING':
+      case 'AWAITING_PLAN_APPROVAL':
+        return { kind: 'status', text: 'Agent is researching…', spinning: true };
+      case 'BUILDING':
+        if (live.hasLiveReviewer)
+          return { kind: 'status', text: 'Reviewer is reading the report…', spinning: true };
+        if (live.hasLiveTaskWorker || live.hasLiveCoder)
+          return { kind: 'status', text: 'Agent is researching…', spinning: true };
+        return {
+          kind: 'button',
+          label: 'Retry research',
+          help: 'Run the research agent again; prior findings feed the next attempt.',
+          action: 'build',
+        };
+      case 'SCANNING':
+        return { kind: 'status', text: 'Scanning the report for secrets…', spinning: true };
+      case 'AWAITING_MERGE_APPROVAL':
+        return {
+          kind: 'scrollButton',
+          label: 'Review & approve ↓',
+          help: 'Read the cited report and approve delivery with your passkey.',
+          target: 'gate-section',
+        };
+      case 'MERGED':
+        return { kind: 'done', text: 'Delivered.' };
+      case 'FAILED':
+        return { kind: 'done', text: 'This mission failed.' };
+      case 'CANCELLED':
+        return { kind: 'done', text: 'This mission was cancelled.' };
+      default:
+        return { kind: 'none' };
+    }
+  }
   // M6b: a low-risk mission flows from "Start planning" straight through
   // live status lines until the merge gate — the plan gate auto-approves.
   if (state === 'AWAITING_PLAN_APPROVAL' && riskLevel === 'low') {

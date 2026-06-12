@@ -4,7 +4,7 @@
  * touch approval or merge/delivery mechanics — this module only decides
  * whether the PLAN gate auto-approves and which scan threshold applies.
  */
-import type { RiskLevel } from '@legion/core';
+import type { EffectiveRiskLevel } from '@legion/core';
 import type { FailLevel } from '@legion/scanner';
 
 export interface RiskPolicy {
@@ -16,15 +16,18 @@ export interface RiskPolicy {
    */
   scanFailLevel: FailLevel | null;
   /** Recorded in the ledger when a gate is waived — policy, never silence. */
-  policyId: `risk:${RiskLevel}`;
+  policyId: string;
 }
 
-const POLICIES: Record<RiskLevel, RiskPolicy> = {
+const POLICIES: Record<EffectiveRiskLevel, RiskPolicy> = {
   low: { autoApprovePlan: true, scanFailLevel: null, policyId: 'risk:low' },
   medium: { autoApprovePlan: false, scanFailLevel: null, policyId: 'risk:medium' },
   high: { autoApprovePlan: false, scanFailLevel: 'warning', policyId: 'risk:high' },
+  // M6d: open missions skip the plan gate entirely (the EXECUTE path records
+  // the waiver itself); scan threshold is the default. Read-only toolset.
+  'open-readonly': { autoApprovePlan: false, scanFailLevel: null, policyId: 'open-readonly' },
 };
 
-export function riskPolicy(risk: RiskLevel): RiskPolicy {
+export function riskPolicy(risk: EffectiveRiskLevel): RiskPolicy {
   return POLICIES[risk];
 }

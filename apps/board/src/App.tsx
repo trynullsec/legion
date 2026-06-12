@@ -277,9 +277,10 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
         title,
         objective,
         kind,
-        riskLevel,
+        // open missions run the read-only policy; the server forces it
+        ...(kind !== 'open' ? { riskLevel } : {}),
         ...(kind === 'code' ? { repoPath } : {}),
-        ...(kind === 'task' && deliverTo.trim() ? { deliverTo: deliverTo.trim() } : {}),
+        ...(kind !== 'code' && deliverTo.trim() ? { deliverTo: deliverTo.trim() } : {}),
       });
       setTitle('');
       setObjective('');
@@ -331,10 +332,20 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
         >
           Task
         </button>
+        <button
+          type="button"
+          className={`btn ${kind === 'open' ? 'btn-primary' : ''}`}
+          aria-pressed={kind === 'open'}
+          onClick={() => setKind('open')}
+        >
+          Open
+        </button>
         <span className="field-help">
           {kind === 'code'
             ? 'Agents change code in a git repository; you approve the merge.'
-            : 'Agents produce a document or dataset; you approve the delivery.'}
+            : kind === 'task'
+              ? 'Agents produce a document or dataset; you approve the delivery.'
+              : 'A read-only research agent searches the web and writes a cited report; you approve the delivery.'}
         </span>
       </div>
       <label>
@@ -373,7 +384,7 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
           </span>
         </label>
       )}
-      {kind === 'task' && (
+      {kind !== 'code' && (
         <label>
           deliver to <span className="mono small">(optional)</span>
           <input
@@ -387,18 +398,28 @@ function NewMissionForm({ onCreated }: { onCreated: () => void }) {
           </span>
         </label>
       )}
-      <label>
-        risk level
-        <select
-          value={riskLevel}
-          onChange={(e) => setRiskLevel(e.target.value as RiskLevel)}
-        >
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-        </select>
-        <span className="field-help">Display-only for now</span>
-      </label>
+      {kind !== 'open' ? (
+        <label>
+          risk level
+          <select
+            value={riskLevel}
+            onChange={(e) => setRiskLevel(e.target.value as RiskLevel)}
+          >
+            <option value="low">low — express (plan auto-approved)</option>
+            <option value="medium">medium — plan needs your approval</option>
+            <option value="high">high — strict scan (warnings block)</option>
+          </select>
+          <span className="field-help">
+            Every mission still parks at the merge gate for your passkey.
+          </span>
+        </label>
+      ) : (
+        <p className="field-help">
+          Open missions run a read-only research policy — no plan gate, web
+          search and fetch only. The report still waits at the gate for your
+          passkey.
+        </p>
+      )}
       <button type="submit" className="btn btn-primary" disabled={busy}>
         {busy && <Star spin />} {busy ? 'Creating…' : 'Create Mission'}
       </button>
@@ -640,11 +661,13 @@ function BuildSection({ mission }: { mission: Mission }) {
   return (
     <section className="build">
       <Divider
-        label={mission.kind === 'task' ? 'Work' : 'Build'}
+        label={mission.kind === 'code' ? 'Build' : mission.kind === 'open' ? 'Research' : 'Work'}
         hint={
-          mission.kind === 'task'
-            ? 'An agent produces the deliverable files; a reviewer agent reads them against the plan before you ever see them.'
-            : 'A coder agent implements the plan with real commits; a reviewer agent reads the diff before you ever see it.'
+          mission.kind === 'code'
+            ? 'A coder agent implements the plan with real commits; a reviewer agent reads the diff before you ever see it.'
+            : mission.kind === 'open'
+              ? 'A read-only agent searches the web and writes a cited report; a reviewer agent reads it before you ever see it.'
+              : 'An agent produces the deliverable files; a reviewer agent reads them against the plan before you ever see them.'
         }
       />
       <Notice error={error} />
@@ -723,7 +746,7 @@ function MergedBanner({ mission }: { mission: Mission }) {
       setDeliveredTo(typeof dt === 'string' ? dt : null);
     });
   }, [mission.missionId]);
-  const task = mission.kind === 'task';
+  const task = mission.kind !== 'code';
   return (
     <section className="approval">
       <Divider label={task ? 'Delivered' : 'Merged'} />
@@ -745,6 +768,31 @@ function MergedBanner({ mission }: { mission: Mission }) {
  * display rendering; everything else is mono text. Archives list every file
  * with a per-file preview. Display-only.
  */
+/**
+ * Inline rendering: markdown links [text](url) and bare urls become real
+ * anchors (M6d: research reports cite sources — citations are clickable).
+ */
+function renderInline(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s)\]]+)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let k = 0;
+  while ((m = pattern.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const href = m[2] ?? m[3]!;
+    const label = m[1] ?? href;
+    out.push(
+      <a key={k++} href={href} target="_blank" rel="noopener noreferrer">
+        {label}
+      </a>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
 function renderMarkdown(md: string): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   const lines = md.split('\n');
@@ -757,7 +805,7 @@ function renderMarkdown(md: string): React.ReactNode[] {
     out.push(
       <ul key={key}>
         {listItems.map((li, i) => (
-          <li key={i}>{li}</li>
+          <li key={i}>{renderInline(li)}</li>
         ))}
       </ul>,
     );
@@ -794,7 +842,7 @@ function renderMarkdown(md: string): React.ReactNode[] {
     }
     flushList(`l${i}`);
     if (line.trim().length > 0) {
-      out.push(<p key={i}>{line}</p>);
+      out.push(<p key={i}>{renderInline(line)}</p>);
     }
   });
   flushList('tail');
@@ -893,7 +941,7 @@ function ApprovalPanel({ mission }: { mission: Mission }) {
     }
   };
 
-  const task = mission.kind === 'task';
+  const task = mission.kind !== 'code';
   return (
     <section className="approval" id="gate-section">
       <Divider
@@ -1402,7 +1450,7 @@ function MissionDetail({
               </span>
             )}
             <span className="mono">
-              {mission.kind === 'task'
+              {mission.kind !== 'code'
                 ? `deliver to: ${mission.deliverTo ?? 'default (~/.legion/deliveries)'}`
                 : mission.repoPath}
             </span>

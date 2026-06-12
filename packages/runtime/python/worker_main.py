@@ -35,6 +35,11 @@ def main():
     model = os.environ.get("LEGION_MODEL")
     base_url = os.environ.get("LEGION_BASE_URL", "https://openrouter.ai/api/v1")
     max_turns = int(os.environ.get("LEGION_MAX_TURNS", "12"))
+    # M6d: which hermes toolset this worker gets. "terminal" (default) for
+    # code/task workers; "web" for open-mission workers — an explicit
+    # read-only allowlist (exactly web_search + web_extract; no shell, no
+    # file tools, no send). Anything not in the toolset is unreachable.
+    toolset = os.environ.get("LEGION_TOOLSET", "terminal")
 
     if not task:
         emit("ERROR", message="LEGION_TASK is not set")
@@ -74,7 +79,7 @@ def main():
         base_url=base_url,
         model=model,
         max_iterations=max_turns,
-        enabled_toolsets=["terminal"],
+        enabled_toolsets=[toolset],
         tool_start_callback=on_tool_start,
         tool_complete_callback=on_tool_complete,
         interim_assistant_callback=on_interim,
@@ -86,12 +91,34 @@ def main():
     except Exception:
         pass
 
+    if toolset == "web":
+        # M6d isolation proof (T75): report, from inside the worker process,
+        # the environment it actually sees. Asserted by the test suite.
+        emit(
+            "AGENT_STATUS",
+            kind="isolation",
+            message=json.dumps(
+                {"toolset": toolset, "envKeys": sorted(os.environ.keys())}
+            ),
+        )
+
     emit("AGENT_STATUS", kind="lifecycle", message=f"task started (model={model})")
     result = agent.run_conversation(task) or {}
 
     final = result.get("final_response") or ""
     if final:
         emit("MODEL_MESSAGE", text=clip(final, 8000), final=True)
+
+    if toolset == "web":
+        # M6d (pin 4/5): the open agent has NO write tools by design — the
+        # launcher (trusted Legion code) seals the agent's final response as
+        # the deliverable. The only write this process performs is here, into
+        # deliverables/ inside its own workdir.
+        if final.strip():
+            os.makedirs("deliverables", exist_ok=True)
+            with open(os.path.join("deliverables", "report.md"), "w") as f:
+                f.write(final)
+            emit("AGENT_STATUS", kind="lifecycle", message="report sealed to deliverables/report.md")
     emit(
         "AGENT_STATUS",
         kind="lifecycle",

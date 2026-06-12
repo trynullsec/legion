@@ -43,6 +43,7 @@ import type { Pool } from 'pg';
 import {
   buildCoderPrompt,
   buildDeliverableReviewerPrompt,
+  buildOpenWorkerPrompt,
   buildPlannerPrompt,
   buildReviewerPrompt,
   buildRevisionPrompt,
@@ -230,11 +231,22 @@ export class Orchestrator {
    */
   async startPlanning(
     missionId: string,
-    options: { taskOverride?: string } = {},
-  ): Promise<{ workerId: string; settled: Promise<PlanningOutcome> }> {
+    options: {
+      taskOverride?: string;
+      /** M6d, internal-only (T74): reviewer overrides for the open EXECUTE. */
+      reviewerTaskOverrides?: string[];
+    } = {},
+  ): Promise<{ workerId: string; settled: Promise<PlanningOutcome | BuildOutcome> }> {
     const result = await getMission(this.pool, missionId);
     if (!result) throw new MissionNotFoundError(missionId);
     const mission = result.mission;
+
+    // M6d (pin 2): open missions have no plan gate — planning/building
+    // collapse into a single EXECUTE. The same canonical states are
+    // traversed; the waiver is recorded as declared policy, never silently.
+    if (mission.kind === 'open') {
+      return this.startOpenExecute(missionId, mission, options);
+    }
 
     if (mission.state !== 'DRAFT' && mission.state !== 'PLANNING') {
       throw new PlanningStateError(missionId, mission.state);
@@ -430,6 +442,88 @@ export class Orchestrator {
   }
 
   // ====================================================================
+  // M6d: open missions — collapsed EXECUTE (read-only web research)
+  // ====================================================================
+
+  /**
+   * Open missions skip the plan gate by declared policy: emit the synthetic
+   * PLANNING_STARTED → PLAN_PROPOSED → PLAN_APPROVED sequence (the machine
+   * is untouched; the ledger records the waiver), then run a deliverable
+   * build attempt whose worker has the read-only web toolset.
+   */
+  private async startOpenExecute(
+    missionId: string,
+    mission: MissionRecord,
+    options: { taskOverride?: string; reviewerTaskOverrides?: string[] },
+  ): Promise<{ workerId: string; settled: Promise<BuildOutcome> }> {
+    if (mission.state !== 'DRAFT' && mission.state !== 'BUILDING') {
+      throw new PlanningStateError(missionId, mission.state);
+    }
+
+    if (mission.state === 'DRAFT') {
+      const syntheticPlan: Plan = {
+        summary: mission.objective,
+        steps: [
+          {
+            n: 1,
+            title: 'Research and report',
+            detail: mission.objective,
+            filesLikelyTouched: ['report.md'],
+          },
+        ],
+        risks: [],
+        openQuestions: [],
+        estimatedComplexity: 'small',
+      };
+      await appendEvent(this.pool, missionId, 'PLANNING_STARTED', {
+        policy: 'open-readonly',
+      });
+      await appendEvent(this.pool, missionId, 'PLAN_PROPOSED', {
+        plan: syntheticPlan,
+        synthetic: true,
+        policy: 'open-readonly',
+      });
+      await appendEvent(this.pool, missionId, 'PLAN_APPROVED', {
+        autoApproved: true,
+        policy: 'open-readonly',
+      });
+    }
+
+    const { coderWorkerId, settled } = await this.startBuild(missionId, {
+      coderTaskOverride: options.taskOverride,
+      reviewerTaskOverrides: options.reviewerTaskOverrides,
+    });
+    return { workerId: coderWorkerId, settled };
+  }
+
+  /**
+   * Env for an open worker: same allowlist + isolated HOME as every worker,
+   * plus the read-only web toolset and the pinned search provider key.
+   * Tavily is the single supported provider (one key drives BOTH web_search
+   * and web_extract in the vendored runtime).
+   */
+  private openWorkerEnv(attemptDir: string): Record<string, string> {
+    const provider = process.env.LEGION_SEARCH_PROVIDER ?? 'tavily';
+    if (provider !== 'tavily') {
+      throw new Error(
+        `LEGION_SEARCH_PROVIDER=${provider} is not supported — 'tavily' is the pinned provider in v0.1`,
+      );
+    }
+    const key = process.env.LEGION_SEARCH_API_KEY;
+    if (!key) {
+      throw new Error(
+        'LEGION_SEARCH_API_KEY is not set — open missions need the pinned search provider',
+      );
+    }
+    return {
+      HOME: attemptDir,
+      TMPDIR: path.join(attemptDir, '.tmp'),
+      LEGION_TOOLSET: 'web',
+      TAVILY_API_KEY: key,
+    };
+  }
+
+  // ====================================================================
   // M3: build loop
   // ====================================================================
 
@@ -473,9 +567,9 @@ export class Orchestrator {
     const attemptDir = path.join(missionBuilds, `attempt-${attempt}`);
     await mkdir(path.join(attemptDir, '.tmp'), { recursive: true });
 
-    // M6a: task missions execute in an isolated workdir with a deliverables/
-    // contract instead of a git clone (pin 3)
-    if (mission.kind === 'task') {
+    // M6a/M6d: task and open missions execute in an isolated workdir with a
+    // deliverables/ contract instead of a git clone
+    if (mission.kind === 'task' || mission.kind === 'open') {
       return this.startTaskBuild({ missionId, mission, plan, overrides, attempt, attemptDir });
     }
 
@@ -536,6 +630,10 @@ export class Orchestrator {
     extraEnv?: Record<string, string>,
   ): Promise<string> {
     const doing = role === 'coder' || role === 'worker';
+    // M6d: open workers (read-only web research) get a tighter turn budget —
+    // search+fetch+report fits comfortably in 16 turns, and a confused model
+    // looping searches is bounded instead of burning 40 × provider latency.
+    const open = extraEnv?.LEGION_TOOLSET === 'web';
     const workerId = await this.supervisor.startWorker({
       missionId,
       role,
@@ -544,7 +642,7 @@ export class Orchestrator {
       extraEnv,
       model: doing ? this.coderModel : this.reviewerModel,
       // implementing a plan takes far more tool iterations than a review
-      maxTurns: doing ? 40 : undefined,
+      maxTurns: open ? 16 : doing ? 40 : undefined,
     });
     await appendWorkerEvent(this.pool, {
       missionId,
@@ -816,8 +914,9 @@ export class Orchestrator {
         undefined,
     };
 
-    // M6a (pin 4): task missions scan the deliverables with gitleaks only
-    if (result.mission.kind === 'task') {
+    // M6a/M6d (pin 4): task and open missions scan the deliverables with
+    // gitleaks only (an agent can paste a fetched secret into a report)
+    if (result.mission.kind !== 'code') {
       const deliverablesDir = path.join(attemptDir, 'work', 'deliverables');
       this.activeScans.add(missionId);
       await appendEvent(this.pool, missionId, 'SCAN_STARTED', { attempt: latest });
@@ -1031,18 +1130,25 @@ export class Orchestrator {
     await mkdir(path.join(workDir, 'deliverables'), { recursive: true });
 
     const priorFailure = await this.reworkFeedback(missionId);
+    const open = mission.kind === 'open';
 
     this.activeBuilds.add(missionId);
     try {
       await appendEvent(this.pool, missionId, 'BUILD_STARTED', { attempt });
 
-      const workerEnv = {
-        HOME: attemptDir, // hermes state lands outside the deliverables tree
-        TMPDIR: path.join(attemptDir, '.tmp'),
-      };
+      // M6d: open workers get the read-only web toolset + pinned search key;
+      // task workers keep the default (terminal) toolset.
+      const workerEnv = open
+        ? this.openWorkerEnv(attemptDir)
+        : {
+            HOME: attemptDir, // hermes state lands outside the deliverables tree
+            TMPDIR: path.join(attemptDir, '.tmp'),
+          };
       const task =
         overrides.coderTaskOverride ??
-        buildTaskWorkerPrompt(mission, plan, priorFailure);
+        (open
+          ? buildOpenWorkerPrompt(mission, priorFailure)
+          : buildTaskWorkerPrompt(mission, plan, priorFailure));
       const workerId = await this.spawnBuildWorker(
         missionId, 'worker', task, workDir, workerEnv,
       );
@@ -1114,13 +1220,20 @@ export class Orchestrator {
       return { kind: 'ATTEMPT_FAILED', reason };
     };
 
+    const open = mission.kind === 'open';
     const MAX_WORKER_CYCLES = 2;
     for (let cycle = 1; cycle <= MAX_WORKER_CYCLES; cycle++) {
       let workerId = ctx.firstWorkerId;
       if (cycle > 1) {
         const task =
           overrides.coderRevisionTaskOverride ??
-          buildTaskRevisionPrompt(mission, plan, review!.comments, review!.summary);
+          (open
+            ? buildOpenWorkerPrompt(
+                mission,
+                `the reviewer requested changes. Review summary: ${review!.summary} — ` +
+                  `comments: ${review!.comments.map((c) => c.body).join('; ')}`,
+              )
+            : buildTaskRevisionPrompt(mission, plan, review!.comments, review!.summary));
         workerId = await this.spawnBuildWorker(
           missionId, 'worker', task, workDir, ctx.workerEnv,
         );
@@ -1148,7 +1261,7 @@ export class Orchestrator {
       );
       const reviewerTask =
         overrides.reviewerTaskOverrides?.[cycle - 1] ??
-        buildDeliverableReviewerPrompt(plan, contents);
+        buildDeliverableReviewerPrompt(plan, contents, { requireCitations: open });
 
       // Same deterministic reviewer retry as the code path: a reviewer
       // occasionally answers in chat instead of writing review.json.

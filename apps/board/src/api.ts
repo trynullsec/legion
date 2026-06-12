@@ -11,7 +11,10 @@ export type MissionState =
 
 export type RiskLevel = 'low' | 'medium' | 'high';
 
-export type MissionKind = 'code' | 'task';
+/** M6d: the recorded risk of an open mission (never a client value). */
+export type EffectiveRiskLevel = RiskLevel | 'open-readonly';
+
+export type MissionKind = 'code' | 'task' | 'open';
 
 export interface Mission {
   missionId: string;
@@ -22,7 +25,7 @@ export interface Mission {
   repoPath: string | null;
   deliverTo: string | null;
   scheduledBy: string | null;
-  riskLevel: RiskLevel;
+  riskLevel: EffectiveRiskLevel;
   createdAt: string;
   updatedAt: string;
   eventCount: number;
@@ -44,7 +47,8 @@ export interface NewMission {
   kind: MissionKind;
   repoPath?: string;
   deliverTo?: string;
-  riskLevel: RiskLevel;
+  /** Omitted for open missions — the server forces 'open-readonly'. */
+  riskLevel?: RiskLevel;
 }
 
 /** Thrown for non-2xx responses; carries the server's error code + raw body. */

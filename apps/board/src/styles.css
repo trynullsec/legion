@@ -931,6 +931,16 @@ p.policy-note {
   border-color: var(--ink-dim);
   color: var(--ink);
 }
+.kind-tag.kind-open {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.md-body a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 
 .kind-toggle {
   display: flex;

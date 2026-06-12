@@ -333,8 +333,9 @@ export async function reconcileMerges(
     const result = await getMission(pool, missionId);
     if (!result || result.mission.state !== 'AWAITING_MERGE_APPROVAL') continue;
 
-    // M6a: task missions reconcile by delivered-file hashes, not merge commits
-    if (result.mission.kind === 'task') {
+    // M6a/M6d: task and open missions reconcile by delivered-file hashes,
+    // not merge commits
+    if (result.mission.kind !== 'code') {
       const deliveriesRoot =
         opts.deliveriesRoot ?? path.join(os.homedir(), '.legion', 'deliveries');
       if (await reconcileDelivery(pool, result.mission, deliveriesRoot)) {

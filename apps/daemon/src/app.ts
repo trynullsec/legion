@@ -7,6 +7,7 @@ import {
   InvalidCronError,
   MISSION_KINDS,
   nextRunAt,
+  OPEN_RISK,
   RISK_LEVELS,
 } from '@legion/core';
 import {
@@ -76,11 +77,19 @@ const createMissionSchema = z
     kind: z.enum(MISSION_KINDS).optional(),
     repoPath: z.string().min(1).optional(),
     deliverTo: z.string().min(1).optional(),
-    riskLevel: z.enum(RISK_LEVELS),
+    // 'open-readonly' is never a client value — open missions get it forced
+    riskLevel: z.enum(RISK_LEVELS).optional(),
   })
   .strict()
   .superRefine((v, ctx) => {
     const kind = v.kind ?? 'code';
+    if (kind !== 'open' && !v.riskLevel) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['riskLevel'],
+        message: 'riskLevel is required for code and task missions',
+      });
+    }
     if (kind === 'code') {
       if (!v.repoPath) {
         ctx.addIssue({
@@ -93,7 +102,7 @@ const createMissionSchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['deliverTo'],
-          message: 'deliverTo is only valid for task missions',
+          message: 'deliverTo is only valid for task and open missions',
         });
       }
     } else {
@@ -101,7 +110,7 @@ const createMissionSchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['repoPath'],
-          message: 'task missions must not name a repository',
+          message: `${kind} missions must not name a repository`,
         });
       }
     }
@@ -113,9 +122,12 @@ const createMissionSchema = z
 // kind discrimination as POST /api/missions (code requires repoPath, task
 // forbids it; deliverTo is task-only). scheduledBy is set by the scheduler,
 // never accepted from a client.
+// Schedules fire code/task templates only (M6c scope); scheduled open
+// missions are not in v0.1 — the riskLevel-forcing policy lives at the
+// mission-creation boundary, which schedules bypass.
 const templateSchema = z
   .object({
-    kind: z.enum(MISSION_KINDS),
+    kind: z.enum(['code', 'task']),
     title: z.string().min(1),
     objective: z.string().min(1),
     repoPath: z.string().min(1).optional(),
@@ -298,7 +310,25 @@ export function createApp(
     // its payload unchanged — folding defaults absent kind to 'code', so every
     // pre-M6a creation payload (and its tests) is untouched. Task missions
     // carry kind:'task' verbatim from the client.
-    const mission = await createMission(pool, parsed.data);
+    // M6d (pin 2): open missions run the read-only policy — riskLevel is
+    // FORCED to 'open-readonly'; a user-sent level is ignored with a
+    // recorded note, never silently dropped.
+    let payload: Parameters<typeof createMission>[1];
+    if (parsed.data.kind === 'open') {
+      const { riskLevel: requested, ...rest } = parsed.data;
+      payload = {
+        ...rest,
+        riskLevel: OPEN_RISK,
+        ...(requested
+          ? {
+              riskLevelNote: `requested riskLevel '${requested}' ignored — open missions run the read-only policy`,
+            }
+          : {}),
+      };
+    } else {
+      payload = parsed.data as Parameters<typeof createMission>[1];
+    }
+    const mission = await createMission(pool, payload);
     return c.json({ mission: serializeMission(mission) }, 201);
   });
 
@@ -685,8 +715,8 @@ export function createApp(
       return c.json({ error: ceremony.error }, ceremony.status);
     }
 
-    // M6a: task missions deliver files instead of merging into a repository
-    if (mission.mission.kind === 'task') {
+    // M6a/M6d: task and open missions deliver files instead of merging
+    if (mission.mission.kind !== 'code') {
       const delivery = await orch.deliverMission(missionId, ceremony.approval.id);
       if (delivery.kind === 'DELIVERED') {
         return c.json({

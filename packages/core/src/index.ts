@@ -9,6 +9,7 @@ export {
   EVENT_TYPES,
   MISSION_KINDS,
   MISSION_STATES,
+  OPEN_RISK,
   RISK_LEVELS,
   TERMINAL_STATES,
 } from './types.js';
@@ -23,6 +24,7 @@ export {
   nextRunAt,
 } from './schedule.js';
 export type {
+  EffectiveRiskLevel,
   EventType,
   FoldEvent,
   MissionCreationPayload,

@@ -18,6 +18,7 @@ export type {
 export {
   buildCoderPrompt,
   buildDeliverableReviewerPrompt,
+  buildOpenWorkerPrompt,
   buildPlannerPrompt,
   buildReviewerPrompt,
   buildRevisionPrompt,
