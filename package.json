@@ -9,7 +9,9 @@
     "migrate": "pnpm --filter @legion/db migrate",
     "build": "turbo run build",
     "dev": "pnpm --filter @legion/board build && pnpm --filter @legion/daemon dev",
-    "test": "turbo run test --concurrency=1",
+    "test": "pnpm run test:fast && pnpm run test:agents",
+    "test:fast": "pnpm --workspace-concurrency=1 --filter @legion/core --filter @legion/db --filter @legion/scanner --filter @legion/board run test && pnpm --filter @legion/daemon run test:fast",
+    "test:agents": "pnpm --filter @legion/runtime run test:agents && pnpm --filter @legion/daemon run test:agents",
     "typecheck": "turbo run typecheck"
   },
   "devDependencies": {

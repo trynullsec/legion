@@ -399,6 +399,29 @@ events would be a ledger-compat break; the UI shows friendlier stage labels).
 
 ## Tests
 
+### Execution protocol: two tiers
+
+`pnpm test` = `test:fast` then `test:agents`.
+
+- **`pnpm test:fast`** — every deterministic suite: `core`, `db`, `scanner`,
+  `board`, and the daemon's `api` + `approval` suites (the WebAuthn ceremonies
+  use the software authenticator — real crypto, no model). **retry: 0** — a
+  deterministic suite that needs a retry is a bug. Expected wall-clock:
+  **under a minute**; cost: **zero** (no model calls).
+- **`pnpm test:agents`** — every suite that spawns real Hermes workers
+  against the real model: `runtime`, then the daemon's `workers`, `planning`,
+  `build`, `scan`, and `task` suites — **per package serially, each suite in
+  its own vitest process** (one long-lived process accumulating dozens of
+  real agent runs is how timeouts compound). Agent suites run with
+  **`--retry=1`**: a re-run of a real test is not a mock — it is how
+  stochastic integration tests are run honestly. Generous per-test timeouts
+  (`--testTimeout=600000` default; suites keep their own explicit budgets).
+  Expected wall-clock: **~20–50 minutes** depending on model latency; cost:
+  **a few tens of cents** in OpenRouter usage for a full pass.
+
+Both tiers fail loudly (never skip) when `OPENROUTER_API_KEY` or the
+provisioned scanners are missing.
+
 | Suite | What it proves |
 | --- | --- |
 | `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework |

@@ -7,7 +7,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run",
+    "test": "pnpm run test:agents",
+    "test:agents": "vitest run --retry=1 --testTimeout=600000",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
