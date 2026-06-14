@@ -69,7 +69,9 @@ describe('T15: API round-trip leaves mission_events untouched', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        role: 'operator',
+        // M7: workers run under an OS capability profile keyed by role — use a
+        // canonical role so the profile resolves (an unknown role refuses).
+        role: 'coder',
         task: "Run the shell command 'sleep 300' and wait for it to complete.",
         workdir: path.join(scratch, `t15-${randomUUID()}`),
       }),

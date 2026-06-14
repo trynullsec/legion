@@ -420,6 +420,74 @@ On a low-risk mission a human still disposes — by cancelling, or by letting
 the work reach the merge gate and rejecting there with a signed ceremony
 (the rework loop carries the reason as always).
 
+## Runtime capability scoping (Milestone 7)
+
+Every worker runs under an **OS-level capability profile scoped to its role**.
+A confused or prompt-injected agent cannot act outside its grant — not by
+instruction, not by accident. This is confinement only: it can only *reduce*
+what a worker may do (the state machine, gate, and ledger are unchanged), and
+it is the precondition for any future consequential-action milestone.
+
+### The profiles (one per role)
+
+| Role | Filesystem | Network | Subprocess |
+| --- | --- | --- | --- |
+| planner | write its workdir (plan.json) only | none | yes |
+| coder | write its workspace clone only | none | yes |
+| reviewer | write its workdir (review.json) only | none | yes |
+| task | write its workdir/deliverables only | none | yes |
+| open | write deliverables only | allowlist (web) | no\* |
+
+Resolution is a pure function (`@legion/core` `resolveCapabilityProfile`); an
+**unknown role throws — never a permissive default**. `write` is a strict
+allowlist (the real teeth: a worker cannot mutate the host or write outside its
+own workspace). `read` is broad for the system runtime — the dynamic linker and
+Python must load or the process can't start at all — but the **repo `.env` is
+explicitly deny-read**, so a confined worker never sees `DATABASE_URL` or keys.
+`network` is enforced by the egress chokepoint below.
+
+### Network: the egress chokepoint + SSRF defense
+
+Every worker also needs to reach the **LLM control-plane endpoint** to think —
+so "net:none" cannot mean zero packets. Instead, each worker gets a **per-worker
+egress proxy on loopback**; seatbelt permits outbound **only** to
+`localhost:<proxyPort>`, and the proxy enforces the per-role allowlist:
+
+- `net:none` (planner/coder/reviewer/task): the proxy allows **only the model
+  host**. A worker told to fetch any other URL fails closed (DNS is denied; the
+  connection is refused) and the attempt is logged.
+- `net:allowlist` (open): the model host **plus** general web, every request
+  routed and **logged as a `NET_REQUEST` worker_event** (`{host, method,
+  allowed, reason}`). **SSRF blocked**: loopback, RFC1918 private ranges,
+  link-local `169.254.0.0/16` (incl. the `169.254.169.254` cloud-metadata IP),
+  CGNAT, and IPv6 ULA/link-local all fail closed — both literal-IP hosts and
+  hostnames that resolve into those ranges.
+
+The resolved profile is recorded as a `CAPABILITY_PROFILE` worker_event **before
+the worker does any work**, so the ledger proves what each worker was allowed to
+do.
+
+### Enforcement mechanism — honest platform matrix
+
+| Platform | Mechanism | Status |
+| --- | --- | --- |
+| **macOS** | `sandbox-exec` (seatbelt) `(deny default)` profile generated per worker, paths realpath-resolved | **Enforced, verified** (T78–T84 run real escape attempts and observe kernel denial) |
+| **Linux** (deploy target) | bubblewrap (`bwrap`): ro-binds for reads, bind for the writable workdir, `--unshare-net` for net:none, egress proxy for allowlist | **Code path provided, NOT verified on this dev machine** (no bwrap/Linux here) — labelled best-effort until a Linux run confirms it |
+| other | — | refuse to start |
+
+**Refuse-to-start is the invariant**: if the chosen mechanism cannot apply a
+profile in the current environment (e.g. running inside another sandbox where
+`sandbox_apply` is denied), the worker is **never run unconfined** — it records
+`WORKER_FAILED {ENFORCEMENT_UNAVAILABLE}` and the spawn throws.
+
+**Honest gaps (macOS):** seatbelt's `process-exec*` is allowed for every role
+(the interpreter must exec to start), so the open role's "no subprocess" is
+enforced by its toolset (web tools only, no shell) rather than by exec-denial;
+and standard character devices (`/dev/null`, `/dev/urandom`, …) are writable
+because every shell needs them. Neither is a path to mutating the host or
+escaping the workspace. Linux/bwrap closes the exec gap with a private mount +
+PID namespace when that path is verified.
+
 ## Open missions: read-only web research (Milestone 6d)
 
 The everything-agent's first capability, scoped **read-only**. An `open`
@@ -540,9 +608,9 @@ provisioned scanners are missing.
 
 | Suite | What it proves |
 | --- | --- |
-| `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework; T62 next-run pure function (cron, UTC/DST, invalid rejection) |
+| `packages/core` | T2–T5 state machine, illegal transitions, rejection loop; T17 plan schema; T23 review schema; T31 scan-failure rework; T44 merge-rejection rework; T62 next-run pure function (cron, UTC/DST, invalid rejection); T77 capability profile resolution (unknown role → error) |
 | `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
 | `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation); T48–T54 task missions (kind boundary, real deliverable production, gitleaks-on-deliverables, tamper-voiding, EMPTY_DELIVERABLE, tar delivery, reviewer loop); T55–T60 express lane (risk-proportional plan gating, scan thresholds, gate invariance, riskLevel immutability); T63–T68 scheduled missions (real firing, concurrency guard, catch-up, run-now/disabled, CRUD) |
 | `apps/board` | M5.5 operator-UX smokes; T61 risk-policy notices (express / strict-scan); T69 schedules view + SCHEDULED tag |
-| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation |
+| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation; T71 open toolset allowlist; **M7**: egress proxy + SSRF (fast); T77-adjacent seatbelt profile gen + T82 refuse-to-start (fast); T78/T79/T81/T84 real seatbelt confinement (agent tier, auto-detecting) |

@@ -26,6 +26,14 @@ export interface RuntimeConfig {
   killGraceMs: number;
   /** Max model iterations per task. */
   maxTurns: number;
+  /**
+   * M7: read-only roots a confined worker needs to exec the runtime — the
+   * venv, the vendored agent, and the launcher dir. Deliberately EXCLUDES the
+   * repo root (and thus .env) so a confined worker cannot read secrets.
+   */
+  runtimeReadRoots: string[];
+  /** Secret-bearing paths explicitly denied to confined workers (e.g. .env). */
+  secretDenyReadPaths: string[];
 }
 
 export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
@@ -38,4 +46,19 @@ export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   timeoutMs: 10 * 60 * 1000,
   killGraceMs: 10 * 1000,
   maxTurns: 12,
+  runtimeReadRoots: [
+    path.join(REPO_ROOT, '.venv-workers'),
+    path.join(REPO_ROOT, 'vendor', 'hermes-agent'),
+    path.join(REPO_ROOT, 'packages', 'runtime', 'python'),
+  ],
+  secretDenyReadPaths: [path.join(REPO_ROOT, '.env')],
 };
+
+/** Host of the LLM control-plane endpoint (always reachable via the proxy). */
+export function modelHostFromBaseUrl(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return 'openrouter.ai';
+  }
+}

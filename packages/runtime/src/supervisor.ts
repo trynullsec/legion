@@ -4,6 +4,11 @@ import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 import {
+  capabilityRoleFor,
+  resolveCapabilityProfile,
+  type CapabilityProfile,
+} from '@legion/core';
+import {
   appendWorkerEvent,
   getWorkerEvents,
   getWorkerRecord,
@@ -14,7 +19,26 @@ import {
   type WorkerRecord,
 } from '@legion/db';
 import type { Pool } from 'pg';
-import { DEFAULT_RUNTIME_CONFIG, type RuntimeConfig } from './config.js';
+import {
+  DEFAULT_RUNTIME_CONFIG,
+  modelHostFromBaseUrl,
+  type RuntimeConfig,
+} from './config.js';
+import { defaultEnforcer, type CapabilityEnforcer } from './enforcer.js';
+import { EgressProxy, buildEgressPolicy } from './egressProxy.js';
+import type { ConcreteGrants } from './seatbelt.js';
+
+export class EnforcementUnavailableError extends Error {
+  constructor(
+    readonly role: string,
+    readonly reason: string,
+  ) {
+    super(
+      `refusing to start ${role} worker: capability enforcement unavailable (${reason})`,
+    );
+    this.name = 'EnforcementUnavailableError';
+  }
+}
 
 export class WorkerNotFoundError extends Error {
   constructor(readonly workerId: string) {
@@ -63,6 +87,8 @@ interface LiveWorker {
   } | null;
   timedOut: boolean;
   exited: Promise<void>;
+  /** M7: per-worker egress chokepoint; closed when the worker exits. */
+  proxy: EgressProxy | null;
 }
 
 const STDERR_TAIL_LINES = 60;
@@ -75,12 +101,18 @@ const STDERR_TAIL_LINES = 60;
 export class WorkerSupervisor {
   private readonly pool: Pool;
   private readonly config: RuntimeConfig;
+  private readonly enforcer: CapabilityEnforcer;
   private readonly live = new Map<string, LiveWorker>();
 
-  constructor(options: { pool: Pool } & Partial<RuntimeConfig>) {
-    const { pool, ...overrides } = options;
+  constructor(
+    options: { pool: Pool; enforcer?: CapabilityEnforcer } & Partial<RuntimeConfig>,
+  ) {
+    const { pool, enforcer, ...overrides } = options;
     this.pool = pool;
     this.config = { ...DEFAULT_RUNTIME_CONFIG, ...overrides };
+    // M7: the OS confinement boundary (seatbelt on macOS, bwrap on Linux).
+    // Injectable so tests can force the unenforceable case (T82).
+    this.enforcer = enforcer ?? defaultEnforcer();
   }
 
   /**
@@ -132,6 +164,22 @@ export class WorkerSupervisor {
       model,
     });
 
+    // M7: resolve the OS capability profile for this worker's role.
+    const profileRole = capabilityRoleFor(input.role, input.extraEnv?.LEGION_TOOLSET);
+    const profile = resolveCapabilityProfile(profileRole);
+
+    // Refuse to start unconfined (pin 2/5, T82). If the OS layer cannot apply
+    // the profile here, the worker never spawns — recorded, then thrown.
+    const enforce = this.enforcer.canEnforce();
+    if (!enforce.ok) {
+      await this.append(input.missionId, workerId, 'WORKER_FAILED', {
+        reason: 'ENFORCEMENT_UNAVAILABLE',
+        mechanism: this.enforcer.mechanism,
+        detail: enforce.reason,
+      });
+      throw new EnforcementUnavailableError(profileRole, enforce.reason);
+    }
+
     // Minimal env allowlist. The parent environment is NOT inherited:
     // no DATABASE_URL, no shell exports, nothing beyond this list.
     const env: Record<string, string> = {
@@ -148,7 +196,64 @@ export class WorkerSupervisor {
       ...input.extraEnv,
     };
 
-    const child = spawn(this.config.venvPython, [this.config.launcherPath], {
+    // M7: per-worker egress chokepoint. seatbelt lets the worker reach ONLY
+    // this proxy on loopback; the proxy enforces the per-role allowlist
+    // (model-only for net:none; model + SSRF-filtered web for open) and logs
+    // every request as a NET_REQUEST event.
+    const proxy = new EgressProxy(
+      buildEgressPolicy(profile.network, modelHostFromBaseUrl(this.config.baseUrl)),
+      (entry) => {
+        const w = this.live.get(workerId);
+        if (w) this.enqueue(w, input.missionId, workerId, 'NET_REQUEST', { ...entry });
+      },
+    );
+    const proxyPort = await proxy.start();
+    const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    env.ALL_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+    env.https_proxy = proxyUrl;
+    env.all_proxy = proxyUrl;
+    // the worker reaches the model through the proxy by hostname; it never
+    // resolves DNS or opens sockets itself (net is otherwise denied)
+    env.NO_PROXY = '';
+    env.no_proxy = '';
+
+    // Concrete grants: writable = the worker's own dirs; readable adds the
+    // runtime roots (venv/vendor/launcher) but NOT the repo root (no .env).
+    const writePaths = [workdir, env.HOME, env.TMPDIR].filter(
+      (p): p is string => typeof p === 'string' && p.length > 0,
+    );
+    const grants: ConcreteGrants = {
+      writePaths: [...new Set(writePaths)],
+      readPaths: [...new Set([...writePaths, ...this.config.runtimeReadRoots])],
+      denyReadPaths: this.config.secretDenyReadPaths,
+      proxyPort,
+    };
+
+    // Record the resolved profile BEFORE any work (pin 4 / T81).
+    await this.append(input.missionId, workerId, 'CAPABILITY_PROFILE', {
+      role: profileRole,
+      mechanism: this.enforcer.mechanism,
+      network: profile.network,
+      canSpawnProcesses: profile.canSpawnProcesses,
+      toolset: profile.toolset,
+      writePaths: grants.writePaths,
+      readPaths: grants.readPaths,
+      proxyPort,
+    });
+
+    // Wrap the spawn in the OS confinement layer.
+    const wrapped = this.enforcer.wrap(
+      profile,
+      grants,
+      tmpdir,
+      this.config.venvPython,
+      [this.config.launcherPath],
+    );
+
+    const child = spawn(wrapped.command, wrapped.args, {
       cwd: workdir,
       env,
       detached: true, // own process group → we can kill the whole tree
@@ -172,10 +277,12 @@ export class WorkerSupervisor {
       stopRequested: null,
       timedOut: false,
       exited,
+      proxy,
     };
     this.live.set(workerId, worker);
 
     child.on('error', (err) => {
+      void worker.proxy?.stop();
       this.enqueue(worker, input.missionId, workerId, 'WORKER_FAILED', {
         reason: 'CRASH',
         error: String(err),
@@ -217,6 +324,7 @@ export class WorkerSupervisor {
         payload: Record<string, unknown>,
       ) => {
         if (worker.graceTimer) clearTimeout(worker.graceTimer);
+        void worker.proxy?.stop(); // close the egress chokepoint
         this.enqueue(worker, input.missionId, workerId, type, payload);
         // resolve the exit promise only after every queued append has landed
         void worker.appendQueue.then(() => {

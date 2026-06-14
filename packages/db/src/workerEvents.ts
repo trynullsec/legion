@@ -14,6 +14,10 @@ export const WORKER_EVENT_TYPES = [
   'WORKER_CREATED',
   'WORKER_STARTED',
   'WORKER_TASK',
+  // M7: the OS-enforced capability grant, recorded before any work, and one
+  // line per egress request through the per-worker proxy (allowed or blocked).
+  'CAPABILITY_PROFILE',
+  'NET_REQUEST',
   'PLAN_INVALID',
   'REVIEW_INVALID',
   'REVIEW_RESULT',

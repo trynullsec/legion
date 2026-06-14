@@ -99,7 +99,7 @@ describe('T11: worker environment is an allowlist — DATABASE_URL is invisible'
     const workdir = path.join(scratch, `t11-${randomUUID()}`);
     const workerId = await supervisor.startWorker({
       missionId,
-      role: 'prober',
+      role: 'coder',
       task:
         'Run this exact shell command in the current working directory: ' +
         'env | cut -d= -f1 | sort > envnames.txt — then finish.',
@@ -126,7 +126,7 @@ describe('T12: hard stop kills the process and records WORKER_KILLED', () => {
     const workdir = path.join(scratch, `t12-${randomUUID()}`);
     const workerId = await supervisor.startWorker({
       missionId,
-      role: 'sleeper',
+      role: 'coder',
       task: "Run the shell command 'sleep 300' and wait for it to complete.",
       workdir,
     });
@@ -160,7 +160,7 @@ describe('T13: hard timeout kills the worker and marks FAILED/TIMEOUT', () => {
     const started = Date.now();
     const workerId = await supervisor.startWorker({
       missionId,
-      role: 'endless',
+      role: 'coder',
       task:
         "Run the shell command 'sleep 1000' and wait for it to finish completely " +
         'before responding. Do not stop early.',
@@ -225,7 +225,7 @@ describe('T16: graceful stop — SIGTERM first, SIGKILL only at the deadline', (
     const workdir = path.join(scratch, `t16a-${randomUUID()}`);
     const workerId = await supervisor.startWorker({
       missionId,
-      role: 'cooperative',
+      role: 'coder',
       task: "Run the shell command 'sleep 300' and wait for it to complete.",
       workdir,
     });
@@ -262,7 +262,7 @@ describe('T16: graceful stop — SIGTERM first, SIGKILL only at the deadline', (
     const workdir = path.join(scratch, `t16b-${randomUUID()}`);
     const workerId = await supervisor.startWorker({
       missionId,
-      role: 'resistant',
+      role: 'coder',
       task:
         'Run this exact shell command and wait for it to finish completely: ' +
         'bash -c \'trap "" TERM; sleep 600\'',

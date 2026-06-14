@@ -23,6 +23,17 @@ export {
   isDue,
   nextRunAt,
 } from './schedule.js';
+export {
+  CAPABILITY_ROLES,
+  capabilityRoleFor,
+  resolveCapabilityProfile,
+  UnknownCapabilityRoleError,
+} from './capability.js';
+export type {
+  CapabilityProfile,
+  CapabilityRole,
+  NetworkPolicy,
+} from './capability.js';
 export type {
   EffectiveRiskLevel,
   EventType,
