@@ -420,6 +420,54 @@ On a low-risk mission a human still disposes — by cancelling, or by letting
 the work reach the merge gate and rejecting there with a signed ceremony
 (the rework loop carries the reason as always).
 
+## Full-capability open missions (Milestone 8)
+
+Open missions graduate from read-only research into **full task execution**.
+The open worker now runs the **complete vendored Hermes core toolset** —
+terminal, `execute_code`, file read/write/patch, browser, web search/extract,
+todo, delegation — and **loops with the native agent runtime until the task is
+actually done** (raised iteration budget + timeout), not a single-shot report.
+The deliverable is whatever the agent produced (files in its workspace, plus
+its final summary), sealed, scanned, and passkey-gated like any other.
+
+**No credentials required to launch.** The execution toolset (terminal, code,
+browser, files, web) needs zero user accounts. Consequential connectors
+(post-to-X, send-email, spend) are explicitly **not** in this milestone — they
+are a later connector milestone, behind the gate.
+
+### Terminal backend (mirrors Hermes)
+
+`LEGION_TERMINAL_BACKEND = docker | local` (default **docker**). We don't
+rewrite tools — we bind the vendored runtime's own backend by setting its
+`TERMINAL_*` env, then drive it through our launcher.
+
+- **docker** (recommended): one **hardened, persistent container per mission**
+  for the worker's whole run — packages, cwd, and files carry across tool
+  calls (Hermes's model). Hermes-grade hardening: `--cap-drop ALL` (with the
+  three narrow file-ownership caps Hermes adds back), `--security-opt
+  no-new-privileges`, `--pids-limit 256`, size-limited tmpfs, a persistent
+  `/workspace` volume under `~/.legion/sandboxes/<missionId>/`, and **no host
+  env forwarded**. Legion stamps each container with a `legion-mission=<id>`
+  label and **stops + removes it on completion**. **If Docker is unavailable
+  while the docker backend is selected, the mission FAILS with a clear
+  `DOCKER_UNAVAILABLE` error — never a silent fallback to local.**
+- **local**: runs on the host (under the M7 seatbelt profile), for users who
+  want it.
+
+### Isolation posture — container on top of M7
+
+Docker-backend open missions are confined **by the container** ("the container
+is the security boundary"). This is **added on top of M7, not instead of it**:
+the worker process is still seatbelt-wrapped, the per-worker egress proxy +
+SSRF blocks still apply to the worker's web tools, and `CAPABILITY_PROFILE` is
+still recorded. The one capability the open profile gains is a **scoped grant
+to the Docker daemon unix socket** (so the worker can orchestrate its
+container); TCP egress stays confined to the loopback proxy. Tool execution —
+the shell, code, file writes — happens inside the container, so an agent that
+tries to write outside `/workspace` or delete host files cannot reach the host
+(T89). The merge gate is unchanged: the sealed workspace deliverable is
+hash-bound to your passkey before delivery.
+
 ## Runtime capability scoping (Milestone 7)
 
 Every worker runs under an **OS-level capability profile scoped to its role**.
@@ -612,5 +660,5 @@ provisioned scanners are missing.
 | `packages/scanner` | T32 real gitleaks+semgrep SARIF merge, counts, threshold, crash handling |
 | `packages/db` | T1 migrations + schema, T2 creation, T7 concurrency (gapless seq, retryable conflicts) |
 | `apps/daemon` | T2–T6, T8 bitemporal HTTP; T15 worker API; T18–T22 planning; T24–T30 build; T33–T38 scan; T39–T47 human gate (real WebAuthn ceremonies via software authenticator, artifact binding, replay/expiry, dirty/conflict merge, crash reconciliation); T48–T54 task missions (kind boundary, real deliverable production, gitleaks-on-deliverables, tamper-voiding, EMPTY_DELIVERABLE, tar delivery, reviewer loop); T55–T60 express lane (risk-proportional plan gating, scan thresholds, gate invariance, riskLevel immutability); T63–T68 scheduled missions (real firing, concurrency guard, catch-up, run-now/disabled, CRUD) |
-| `apps/board` | M5.5 operator-UX smokes; T61 risk-policy notices (express / strict-scan); T69 schedules view + SCHEDULED tag |
-| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation; T71 open toolset allowlist; **M7**: egress proxy + SSRF (fast); T77-adjacent seatbelt profile gen + T82 refuse-to-start (fast); T78/T79/T81/T84 real seatbelt confinement (agent tier, auto-detecting) |
+| `apps/board` | M5.5 operator-UX smokes; T61 risk-policy notices (express / strict-scan); T69 schedules view + SCHEDULED tag; T76 open selector + cited preview; T92 open live-tool feed + workspace tree |
+| `packages/runtime` | T9 venv provisioning, T10 real trajectory, T11 env isolation, T12 hard kill, T13 timeout, T14 orphan reconciliation, T16 graceful-stop escalation; T71 open toolset allowlist; **M7**: egress proxy + SSRF (fast); T77-adjacent seatbelt profile gen + T82 refuse-to-start (fast); T78/T79/T81/T84 real seatbelt confinement (agent tier, auto-detecting); **M8**: T85 full toolset, T88 backend resolution + docker-unavailable fail, T86/T89 docker lifecycle + host safety (auto-detecting) |

@@ -108,10 +108,16 @@ beforeAll(async () => {
   pool = createPool();
   await runMigrations(pool);
   await pool.query('truncate approvers, approval_challenges, approvals');
-  supervisor = new WorkerSupervisor({ pool });
+  // M8: open missions are now full-capability. This suite covers the
+  // backend-agnostic contracts (boundary, gate, dirty-deliverable scan,
+  // isolation proof) on the LOCAL backend — full toolset on the host under
+  // seatbelt, no Docker needed. The Docker backend + multi-step execution
+  // are covered by open-exec.test.ts (T86/T87/T89) and the runtime suite.
+  supervisor = new WorkerSupervisor({ pool, terminalBackend: 'local' });
   scratch = await mkdtemp(path.join(REPO_ROOT, '.tmp', 'open-'));
   orchestrator = new Orchestrator({
     pool, supervisor,
+    terminalBackend: 'local',
     workdirRoot: path.join(scratch, 'workdirs'),
     buildsRoot: path.join(scratch, 'builds'),
     artifactsRoot: path.join(scratch, 'artifacts'),
@@ -204,8 +210,8 @@ describe('T70: open mission boundary', () => {
 // T72: happy path — real search, real fetch, cited report, to the gate
 // ====================================================================
 
-describe('T72: open mission happy path', () => {
-  it('EXECUTE → report.md with ≥1 cited url → reviewer → gitleaks → AWAITING_MERGE_APPROVAL', async () => {
+describe('T72: open mission happy path (local backend, full toolset)', () => {
+  it('EXECUTE → workspace deliverable → reviewer → gitleaks → AWAITING_MERGE_APPROVAL', async () => {
     const missionId = await createOpenMission();
 
     // one call starts the whole flow (collapsed EXECUTE)
@@ -227,24 +233,11 @@ describe('T72: open mission happy path', () => {
     const approved = events.find((e) => e.type === 'PLAN_APPROVED')!;
     expect(approved.payload.policy).toBe('open-readonly');
 
-    // the deliverable is a markdown report with at least one cited url
+    // M8: the deliverable is whatever the agent produced + its final summary,
+    // sealed as an artifact (no longer a single read-only report).
     const artifacts = await listArtifacts(pool, missionId);
     const deliverable = artifacts.find((a) => a.type === 'deliverable')!;
     expect(deliverable).toBeTruthy();
-    const report = await readFile(deliverable.path, 'utf8');
-    expect(report.trim().length).toBeGreaterThan(100);
-    expect(report).toMatch(/https?:\/\/[^\s)\]]+/);
-
-    // the worker actually used the web tools (real search/fetch in the trajectory)
-    const workers = await listMissionWorkers(pool, missionId);
-    const open = workers.find((w) => w.role === 'worker')!;
-    const { rows } = await pool.query(
-      `select 1 from worker_events
-        where worker_id = $1 and type = 'TOOL_CALL'
-          and (payload->>'tool' like 'web_%')`,
-      [open.workerId],
-    );
-    expect(rows.length).toBeGreaterThanOrEqual(1);
 
     // gitleaks-only scan passed
     const scan = await pollScanDone(missionId);
@@ -366,11 +359,13 @@ describe('T74: dirty open deliverable', () => {
 });
 
 // ====================================================================
-// T75: isolation proof — no DATABASE_URL, no writes outside deliverables/
+// T75 (M8): isolation proof — CAPABILITY_PROFILE(open) + env excludes
+// DATABASE_URL. (Host-write safety under the container boundary is T89;
+// the worker-process seatbelt confinement is M7's T84.)
 // ====================================================================
 
-describe('T75: open worker isolation', () => {
-  it('launcher-emitted env proof excludes DATABASE_URL; workdir contains only deliverables/', async () => {
+describe('T75: open worker isolation proof', () => {
+  it('records CAPABILITY_PROFILE(open) and the launcher env excludes DATABASE_URL', async () => {
     const missionId = await createOpenMission();
 
     // spawn a REAL open worker; the launcher emits the isolation proof
@@ -381,6 +376,17 @@ describe('T75: open worker isolation', () => {
         'Do not call any tools. Respond with exactly this final message: ready',
     });
     void settled.catch(() => {}); // the kill below fails the attempt; that's fine
+
+    // CAPABILITY_PROFILE recorded for the open role before any work (T81/T90)
+    await pollUntil(async () => {
+      const { rows } = await pool.query(
+        `select 1 from worker_events
+          where worker_id = $1 and type = 'CAPABILITY_PROFILE'
+            and payload->>'role' = 'open'`,
+        [workerId],
+      );
+      return rows.length === 1;
+    }, 'CAPABILITY_PROFILE(open)', 120_000);
 
     let isolationRow: { payload: { message: string } } | undefined;
     await pollUntil(async () => {
@@ -397,17 +403,13 @@ describe('T75: open worker isolation', () => {
     // the launcher (inside the worker process, T11 precedent) reports its env
     const isolation = JSON.parse(String(isolationRow!.payload.message));
     expect(isolation.envKeys).not.toContain('DATABASE_URL');
-    expect(isolation.toolset).toBe('web');
+    expect(isolation.backend).toBe('local'); // this suite runs the local backend
 
     await supervisor.stopWorker(workerId, { graceful: false }).catch(() => {});
     await supervisor.waitForExit(workerId, 30_000).catch(() => {});
 
-    // the worker's workdir contains nothing but deliverables/ and the
-    // supervisor-provisioned (M1) .tmp scratch dir. The agent itself wrote no
-    // files (no shell tool, no file tools; T71 proves the registry, this
-    // proves the disk). .tmp holds only Legion's own control file — the M7
-    // seatbelt profile (capability.sb), written by the UNCONFINED supervisor
-    // and already loaded by the kernel at exec — not agent output.
+    // the worker's workdir holds only deliverables/ + the supervisor's .tmp
+    // (which carries Legion's own seatbelt profile, not agent output).
     const workers = await listMissionWorkers(pool, missionId);
     const open = workers.find((w) => w.workerId === workerId)!;
     const entries = await readdir(open.workdir, { withFileTypes: true });

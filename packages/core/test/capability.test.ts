@@ -39,11 +39,11 @@ describe('T77: capability profile resolution', () => {
     expect(p.toolset).toBe('terminal');
   });
 
-  it('open: allowlist net, NO subprocess, web toolset', () => {
+  it('open (M8 full-capability): allowlist net, MAY spawn, full toolset', () => {
     const p = resolveCapabilityProfile('open');
     expect(p.network).toBe('allowlist');
-    expect(p.canSpawnProcesses).toBe(false);
-    expect(p.toolset).toBe('web');
+    expect(p.canSpawnProcesses).toBe(true); // M8: full execution (was read-only in M6d)
+    expect(p.toolset).toBe('full');
   });
 
   it('every profile reports its own role id', () => {
@@ -61,11 +61,12 @@ describe('T77: capability profile resolution', () => {
     expect(() => resolveCapabilityProfile('admin')).toThrow(/refusing a permissive default/);
   });
 
-  it('capabilityRoleFor maps (role, toolset) to the profile key', () => {
+  it('capabilityRoleFor maps (role, explicit capability hint) to the profile key', () => {
     expect(capabilityRoleFor('planner')).toBe('planner');
     expect(capabilityRoleFor('coder')).toBe('coder');
     expect(capabilityRoleFor('reviewer')).toBe('reviewer');
     expect(capabilityRoleFor('worker')).toBe('task'); // task deliverable worker
-    expect(capabilityRoleFor('worker', 'web')).toBe('open'); // open research worker
+    // M8: open is marked by an explicit capability role (toolset is no longer 'web')
+    expect(capabilityRoleFor('worker', 'open')).toBe('open');
   });
 });

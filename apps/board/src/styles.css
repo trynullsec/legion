@@ -942,6 +942,22 @@ p.policy-note {
   text-underline-offset: 3px;
 }
 
+/* M8: workspace file tree at the open-mission gate */
+.workspace-tree {
+  border: 1px solid var(--hairline);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.workspace-tree-label {
+  color: var(--ink-faint);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.workspace-tree ul {
+  margin: 8px 0 0 16px;
+  color: var(--ink-dim);
+}
+
 .kind-toggle {
   display: flex;
   align-items: center;

@@ -29,6 +29,13 @@ export interface ConcreteGrants {
    * never see. Deny rules win over the blanket read allow.
    */
   denyReadPaths?: string[];
+  /**
+   * M8 (pin 5, "scoped"): the Docker daemon unix socket the open worker may
+   * connect to in order to orchestrate its container. Granting this unix-socket
+   * egress does NOT grant TCP egress — that stays confined to the loopback
+   * proxy. When absent, no socket egress is allowed.
+   */
+  dockerSocket?: string;
 }
 
 export class EnforcementUnavailableError extends Error {
@@ -93,6 +100,16 @@ export function buildSeatbeltProfile(
     // proxy a hostname and the proxy (in the unconfined daemon) dials out.
     `(allow network-outbound (remote ip ${sbString(`localhost:${grants.proxyPort}`)}))`,
   ];
+
+  // M8: scoped Docker socket egress for open workers (TCP egress stays
+  // proxy-confined; this is unix-socket egress to the local daemon only).
+  if (grants.dockerSocket) {
+    const sock = resolveSafe(grants.dockerSocket);
+    lines.push(
+      `(allow network-outbound (remote unix-socket (path-literal ${sbString(sock)})))`,
+      `(allow file-write* (literal ${sbString(sock)}))`,
+    );
+  }
 
   return lines.join('\n') + '\n';
 }

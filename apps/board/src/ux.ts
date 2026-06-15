@@ -125,6 +125,17 @@ export function summarizeEvent(e: WorkerEvent): FeedLine | null {
         const { command } = parseToolArgs(p.args);
         return { text: describeCommand(command ?? ''), danger: false };
       }
+      // M8 full-capability tools — render each meaningfully in the live feed
+      const args = parseToolArgs(p.args) as Record<string, unknown>;
+      if (tool === 'execute_code') return { text: 'Ran code', danger: false };
+      if (tool === 'write_file') return { text: `Wrote ${args.path ?? 'a file'}`, danger: false };
+      if (tool === 'read_file') return { text: `Read ${args.path ?? 'a file'}`, danger: false };
+      if (tool === 'patch') return { text: `Patched ${args.path ?? 'a file'}`, danger: false };
+      if (tool === 'search_files') return { text: 'Searched files', danger: false };
+      if (tool === 'web_search') return { text: `Searched the web`, danger: false };
+      if (tool === 'web_extract') return { text: 'Fetched a page', danger: false };
+      if (tool.startsWith('browser_')) return { text: `Browser: ${tool.slice(8)}`, danger: false };
+      if (tool === 'todo') return { text: 'Updated its to-do list', danger: false };
       return { text: `Used ${tool}`, danger: false };
     }
     case 'MODEL_MESSAGE': {

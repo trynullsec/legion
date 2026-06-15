@@ -1,6 +1,15 @@
-export { DEFAULT_RUNTIME_CONFIG, modelHostFromBaseUrl, REPO_ROOT } from './config.js';
-export type { RuntimeConfig } from './config.js';
 export {
+  DEFAULT_RUNTIME_CONFIG,
+  detectDockerSocket,
+  dockerWorkspaceDir,
+  modelHostFromBaseUrl,
+  REPO_ROOT,
+  resolveTerminalBackend,
+} from './config.js';
+export type { RuntimeConfig, TerminalBackend } from './config.js';
+export {
+  dockerAvailable,
+  DockerUnavailableError,
   EnforcementUnavailableError,
   WorkerNotFoundError,
   WorkerNotRunningError,

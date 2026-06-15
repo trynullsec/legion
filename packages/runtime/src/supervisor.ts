@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -21,6 +21,7 @@ import {
 import type { Pool } from 'pg';
 import {
   DEFAULT_RUNTIME_CONFIG,
+  detectDockerSocket,
   modelHostFromBaseUrl,
   type RuntimeConfig,
 } from './config.js';
@@ -38,6 +39,29 @@ export class EnforcementUnavailableError extends Error {
     );
     this.name = 'EnforcementUnavailableError';
   }
+}
+
+/** M8: docker backend selected but the daemon is unreachable — never silently local. */
+export class DockerUnavailableError extends Error {
+  constructor(readonly detail: string) {
+    super(
+      `refusing to start open worker: terminal backend 'docker' is selected but Docker is unavailable (${detail})`,
+    );
+    this.name = 'DockerUnavailableError';
+  }
+}
+
+/** Is the Docker daemon reachable right now? (cheap `docker version` probe). */
+export function dockerAvailable(): { ok: boolean; detail: string } {
+  const r = spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], {
+    encoding: 'utf8',
+    timeout: 15_000,
+  });
+  if (r.error) return { ok: false, detail: String(r.error) };
+  if (r.status !== 0) {
+    return { ok: false, detail: (r.stderr || `exit ${r.status}`).trim().slice(0, 300) };
+  }
+  return { ok: true, detail: `server ${r.stdout.trim()}` };
 }
 
 export class WorkerNotFoundError extends Error {
@@ -89,6 +113,8 @@ interface LiveWorker {
   exited: Promise<void>;
   /** M7: per-worker egress chokepoint; closed when the worker exits. */
   proxy: EgressProxy | null;
+  /** M8: docker container label to reap on exit (open + docker backend). */
+  dockerMissionLabel: string | null;
 }
 
 const STDERR_TAIL_LINES = 60;
@@ -104,15 +130,23 @@ export class WorkerSupervisor {
   private readonly enforcer: CapabilityEnforcer;
   private readonly live = new Map<string, LiveWorker>();
 
+  private readonly dockerProbe: () => { ok: boolean; detail: string };
+
   constructor(
-    options: { pool: Pool; enforcer?: CapabilityEnforcer } & Partial<RuntimeConfig>,
+    options: {
+      pool: Pool;
+      enforcer?: CapabilityEnforcer;
+      /** M8: injectable Docker availability probe (tests force the down case). */
+      dockerProbe?: () => { ok: boolean; detail: string };
+    } & Partial<RuntimeConfig>,
   ) {
-    const { pool, enforcer, ...overrides } = options;
+    const { pool, enforcer, dockerProbe, ...overrides } = options;
     this.pool = pool;
     this.config = { ...DEFAULT_RUNTIME_CONFIG, ...overrides };
     // M7: the OS confinement boundary (seatbelt on macOS, bwrap on Linux).
     // Injectable so tests can force the unenforceable case (T82).
     this.enforcer = enforcer ?? defaultEnforcer();
+    this.dockerProbe = dockerProbe ?? dockerAvailable;
   }
 
   /**
@@ -164,9 +198,31 @@ export class WorkerSupervisor {
       model,
     });
 
-    // M7: resolve the OS capability profile for this worker's role.
-    const profileRole = capabilityRoleFor(input.role, input.extraEnv?.LEGION_TOOLSET);
+    // M7/M8: resolve the OS capability profile. The orchestrator passes an
+    // explicit LEGION_CAPABILITY_ROLE for worker-role spawns (open vs task).
+    const profileRole = capabilityRoleFor(
+      input.role,
+      input.extraEnv?.LEGION_CAPABILITY_ROLE,
+    );
     const profile = resolveCapabilityProfile(profileRole);
+
+    // M8: full-capability open missions run their tools in a Docker container
+    // (the security boundary). docker selected + unavailable → FAIL, never
+    // silently run on the host (pin 2).
+    const useDocker =
+      profileRole === 'open' && this.config.terminalBackend === 'docker';
+    let dockerMissionLabel: string | null = null;
+    if (useDocker) {
+      const probe = this.dockerProbe();
+      if (!probe.ok) {
+        await this.append(input.missionId, workerId, 'WORKER_FAILED', {
+          reason: 'DOCKER_UNAVAILABLE',
+          detail: probe.detail,
+        });
+        throw new DockerUnavailableError(probe.detail);
+      }
+      dockerMissionLabel = `legion-mission=${input.missionId}`;
+    }
 
     // Refuse to start unconfined (pin 2/5, T82). If the OS layer cannot apply
     // the profile here, the worker never spawns — recorded, then thrown.
@@ -220,6 +276,31 @@ export class WorkerSupervisor {
     env.NO_PROXY = '';
     env.no_proxy = '';
 
+    // M8: bind Hermes' terminal backend via env (we never rewrite its tools).
+    // docker → one hardened, per-mission persistent container; the host
+    // workspace lives under sandboxesRoot/<missionId> and is the deliverable
+    // source. An explicit mission label lets us reap the container on exit.
+    let dockerSocket: string | undefined;
+    if (profileRole === 'open') {
+      if (useDocker) {
+        const sandboxDir = path.join(this.config.sandboxesRoot, input.missionId);
+        dockerSocket = detectDockerSocket() ?? undefined;
+        Object.assign(env, {
+          TERMINAL_ENV: 'docker',
+          TERMINAL_DOCKER_IMAGE: this.config.dockerImage,
+          TERMINAL_SANDBOX_DIR: sandboxDir,
+          TERMINAL_CWD: '/workspace',
+          TERMINAL_CONTAINER_PERSISTENT: 'true', // bind-mount /workspace (carries across calls)
+          TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES: 'false', // remove on completion
+          TERMINAL_DOCKER_ORPHAN_REAPER: 'true',
+          TERMINAL_DOCKER_FORWARD_ENV: '[]', // no host env into the container
+          TERMINAL_DOCKER_EXTRA_ARGS: JSON.stringify(['--label', dockerMissionLabel]),
+        });
+      } else {
+        env.TERMINAL_ENV = 'local'; // host execution under seatbelt
+      }
+    }
+
     // Concrete grants: writable = the worker's own dirs; readable adds the
     // runtime roots (venv/vendor/launcher) but NOT the repo root (no .env).
     const writePaths = [workdir, env.HOME, env.TMPDIR].filter(
@@ -230,6 +311,11 @@ export class WorkerSupervisor {
       readPaths: [...new Set([...writePaths, ...this.config.runtimeReadRoots])],
       denyReadPaths: this.config.secretDenyReadPaths,
       proxyPort,
+      // M8 (pin 5, "scoped"): the open worker orchestrates Docker via the
+      // daemon's unix socket. Grant exactly that socket for egress; TCP egress
+      // stays confined to the loopback proxy. Tool execution happens inside
+      // the container (the boundary), not on the seatbelt-confined host process.
+      ...(useDocker && dockerSocket ? { dockerSocket } : {}),
     };
 
     // Record the resolved profile BEFORE any work (pin 4 / T81).
@@ -242,6 +328,8 @@ export class WorkerSupervisor {
       writePaths: grants.writePaths,
       readPaths: grants.readPaths,
       proxyPort,
+      terminalBackend: profileRole === 'open' ? (useDocker ? 'docker' : 'local') : undefined,
+      dockerSocket: dockerSocket ?? undefined,
     });
 
     // Wrap the spawn in the OS confinement layer.
@@ -278,6 +366,7 @@ export class WorkerSupervisor {
       timedOut: false,
       exited,
       proxy,
+      dockerMissionLabel,
     };
     this.live.set(workerId, worker);
 
@@ -325,6 +414,7 @@ export class WorkerSupervisor {
       ) => {
         if (worker.graceTimer) clearTimeout(worker.graceTimer);
         void worker.proxy?.stop(); // close the egress chokepoint
+        reapMissionContainer(worker.dockerMissionLabel); // M8: stop+rm the mission's container
         this.enqueue(worker, input.missionId, workerId, type, payload);
         // resolve the exit promise only after every queued append has landed
         void worker.appendQueue.then(() => {
@@ -577,6 +667,26 @@ function pidAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * M8: stop + remove the mission's Docker container(s) by our explicit label.
+ * Guarantees the per-mission container is gone on completion regardless of
+ * Hermes' own persist settings. Best-effort, fire-and-forget.
+ */
+function reapMissionContainer(label: string | null): void {
+  if (!label) return;
+  try {
+    const ls = spawnSync('docker', ['ps', '-aq', '--filter', `label=${label}`], {
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    const ids = (ls.stdout ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
+    if (ids.length === 0) return;
+    spawnSync('docker', ['rm', '-f', ...ids], { timeout: 30_000 });
+  } catch {
+    /* best effort — orphan reaper is the backstop */
   }
 }
 

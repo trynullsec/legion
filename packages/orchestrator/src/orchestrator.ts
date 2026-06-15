@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { cp, readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -38,7 +39,7 @@ import {
   type FailLevel,
   type SarifDocument,
 } from '@legion/scanner';
-import type { WorkerSupervisor } from '@legion/runtime';
+import { dockerWorkspaceDir, type WorkerSupervisor } from '@legion/runtime';
 import type { Pool } from 'pg';
 import {
   buildCoderPrompt,
@@ -172,6 +173,12 @@ export interface OrchestratorOptions {
   artifactsRoot?: string;
   /** M6a: default delivery root for task missions; default ~/.legion/deliveries. */
   deliveriesRoot?: string;
+  /** M8: terminal backend for open missions ('docker' default | 'local'). */
+  terminalBackend?: 'docker' | 'local';
+  /** M8: host root for per-mission Docker workspace volumes; must match the supervisor. */
+  sandboxesRoot?: string;
+  /** M8: the vendored Hermes toolset an open worker enables (full core exec). */
+  openMissionToolset?: string;
 }
 
 /**
@@ -190,6 +197,9 @@ export class Orchestrator {
   private readonly buildsRoot: string;
   private readonly artifactsRoot: string;
   private readonly deliveriesRoot: string;
+  private readonly terminalBackend: 'docker' | 'local';
+  private readonly sandboxesRoot: string;
+  private readonly openMissionToolset: string;
   private readonly activeBuilds = new Set<string>();
   private readonly activeScans = new Set<string>();
 
@@ -221,6 +231,14 @@ export class Orchestrator {
       options.artifactsRoot ?? path.join(os.homedir(), '.legion', 'artifacts');
     this.deliveriesRoot =
       options.deliveriesRoot ?? path.join(os.homedir(), '.legion', 'deliveries');
+    // M8: open-mission execution backend + workspace root (must match the
+    // supervisor's so we collect the deliverable from the right host path).
+    this.terminalBackend =
+      options.terminalBackend ??
+      (process.env.LEGION_TERMINAL_BACKEND === 'local' ? 'local' : 'docker');
+    this.sandboxesRoot =
+      options.sandboxesRoot ?? path.join(os.homedir(), '.legion', 'sandboxes');
+    this.openMissionToolset = options.openMissionToolset ?? 'hermes-api-server';
   }
 
   /**
@@ -500,12 +518,13 @@ export class Orchestrator {
   }
 
   /**
-   * Env for an open worker: same allowlist + isolated HOME as every worker,
-   * plus the read-only web toolset and the pinned search provider key.
-   * Tavily is the single supported provider (one key drives BOTH web_search
-   * and web_extract in the vendored runtime).
+   * Env for an M8 full-capability open worker: same allowlist + isolated HOME
+   * as every worker, the FULL Hermes core toolset, and the pinned search key.
+   * The supervisor adds the Docker TERMINAL_* env when backend=docker; for the
+   * local backend the agent runs on the host with its cwd pointed at the
+   * deliverables dir so produced files are collected directly.
    */
-  private openWorkerEnv(attemptDir: string): Record<string, string> {
+  private openWorkerEnv(attemptDir: string, workDir: string): Record<string, string> {
     const provider = process.env.LEGION_SEARCH_PROVIDER ?? 'tavily';
     if (provider !== 'tavily') {
       throw new Error(
@@ -518,12 +537,21 @@ export class Orchestrator {
         'LEGION_SEARCH_API_KEY is not set — open missions need the pinned search provider',
       );
     }
-    return {
+    const env: Record<string, string> = {
       HOME: attemptDir,
       TMPDIR: path.join(attemptDir, '.tmp'),
-      LEGION_TOOLSET: 'web',
+      LEGION_CAPABILITY_ROLE: 'open', // drives the M7/M8 profile + launcher branch
+      LEGION_TOOLSET: this.openMissionToolset,
       TAVILY_API_KEY: key,
     };
+    if (this.terminalBackend === 'local') {
+      // host execution under seatbelt — produced files land in deliverables/
+      env.TERMINAL_ENV = 'local';
+      env.TERMINAL_CWD = path.join(workDir, 'deliverables');
+    }
+    // docker backend TERMINAL_* env is set by the supervisor (it owns the
+    // sandbox path + container label + hardening).
+    return env;
   }
 
   // ====================================================================
@@ -633,10 +661,10 @@ export class Orchestrator {
     extraEnv?: Record<string, string>,
   ): Promise<string> {
     const doing = role === 'coder' || role === 'worker';
-    // M6d: open workers (read-only web research) get a tighter turn budget —
-    // search+fetch+report fits comfortably in 16 turns, and a confused model
-    // looping searches is bounded instead of burning 40 × provider latency.
-    const open = extraEnv?.LEGION_TOOLSET === 'web';
+    // M8: full-capability open workers loop with the whole toolset until the
+    // task is actually done — they need a generous budget for real multi-step
+    // work (fetch + code + files), far more than M6d's read-only 16.
+    const open = extraEnv?.LEGION_CAPABILITY_ROLE === 'open';
     const workerId = await this.supervisor.startWorker({
       missionId,
       role,
@@ -649,8 +677,10 @@ export class Orchestrator {
           ? { ...extraEnv, LEGION_SEAL_FILE: 'review.json' }
           : extraEnv,
       model: doing ? this.coderModel : this.reviewerModel,
-      // implementing a plan takes far more tool iterations than a review
-      maxTurns: open ? 16 : doing ? 40 : undefined,
+      // open: full multi-step execution budget; coder: 40; reviewer: default
+      maxTurns: open ? 60 : doing ? 40 : undefined,
+      // open multi-step work (docker spin-up + tools) needs a longer deadline
+      timeoutMs: open ? 20 * 60 * 1000 : undefined,
     });
     await appendWorkerEvent(this.pool, {
       missionId,
@@ -1144,10 +1174,10 @@ export class Orchestrator {
     try {
       await appendEvent(this.pool, missionId, 'BUILD_STARTED', { attempt });
 
-      // M6d: open workers get the read-only web toolset + pinned search key;
+      // M8: open workers get the full Hermes toolset + (docker/local) backend;
       // task workers keep the default (terminal) toolset.
       const workerEnv = open
-        ? this.openWorkerEnv(attemptDir)
+        ? this.openWorkerEnv(attemptDir, workDir)
         : {
             HOME: attemptDir, // hermes state lands outside the deliverables tree
             TMPDIR: path.join(attemptDir, '.tmp'),
@@ -1173,6 +1203,53 @@ export class Orchestrator {
     } catch (e) {
       this.activeBuilds.delete(missionId);
       throw e;
+    }
+  }
+
+  /**
+   * M8: gather an open mission's output into workDir/deliverables. With the
+   * docker backend the agent wrote into the container's /workspace (host:
+   * sandboxesRoot/<id>/docker/default/workspace) — copy that tree in. With the
+   * local backend the agent's cwd already IS deliverables/. Either way, capture
+   * the agent's final message as SUMMARY.md so the deliverable is never empty
+   * and always carries a human-readable summary.
+   */
+  private async harvestOpenDeliverable(
+    missionId: string,
+    workerId: string,
+    workDir: string,
+  ): Promise<void> {
+    const deliverables = path.join(workDir, 'deliverables');
+    await mkdir(deliverables, { recursive: true });
+
+    if (this.terminalBackend === 'docker') {
+      const workspace = dockerWorkspaceDir(this.sandboxesRoot, missionId);
+      try {
+        // copy the container workspace contents into deliverables/ (skip dotfiles)
+        const entries = await readdir(workspace, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;
+          await cp(path.join(workspace, e.name), path.join(deliverables, e.name), {
+            recursive: true,
+          });
+        }
+      } catch {
+        /* no workspace produced — SUMMARY.md below still yields a deliverable */
+      }
+    }
+
+    // final summary from the worker's last model message
+    try {
+      const events = await getWorkerEvents(this.pool, workerId);
+      const finalMsg = [...events]
+        .reverse()
+        .find((e) => e.type === 'MODEL_MESSAGE' && e.payload.text);
+      const summaryPath = path.join(deliverables, 'SUMMARY.md');
+      if (finalMsg && !existsSync(summaryPath)) {
+        await writeFile(summaryPath, String(finalMsg.payload.text));
+      }
+    } catch {
+      /* best effort */
     }
   }
 
@@ -1254,6 +1331,14 @@ export class Orchestrator {
         return fail(`WORKER_${worker?.status ?? 'UNKNOWN'}`);
       }
 
+      // M8: an open mission's deliverable is whatever the agent produced in
+      // its workspace, plus its final summary. Harvest those into the
+      // deliverables/ dir so the existing collect → scan → seal → gate →
+      // deliver path applies unchanged.
+      if (open) {
+        await this.harvestOpenDeliverable(missionId, workerId, workDir);
+      }
+
       // A worker that exits cleanly without producing files made nothing
       // reviewable — fail fast (EMPTY_DELIVERABLE mirrors EMPTY_DIFF).
       const files = await this.collectDeliverables(workDir);
@@ -1267,9 +1352,12 @@ export class Orchestrator {
           content: await readFile(f.absPath, 'utf8'),
         })),
       );
+      // M8: open missions are general full-capability execution (not just
+      // research), so citations are no longer a hard reviewer requirement —
+      // the reviewer judges the deliverable against the objective.
       const reviewerTask =
         overrides.reviewerTaskOverrides?.[cycle - 1] ??
-        buildDeliverableReviewerPrompt(plan, contents, { requireCitations: open });
+        buildDeliverableReviewerPrompt(plan, contents);
 
       // Same deterministic reviewer retry as the code path: a reviewer
       // occasionally answers in chat instead of writing review.json.

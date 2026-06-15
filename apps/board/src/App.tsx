@@ -865,11 +865,15 @@ function DeliverablePreviewBox({ missionId }: { missionId: string }) {
 
   return (
     <div className="deliverable-preview">
-      {preview.archive && (
-        <p className="mono small">
-          {preview.files.length} files in this deliverable:
-        </p>
-      )}
+      {/* M8: the workspace file tree the agent produced */}
+      <div className="workspace-tree mono small" data-testid="workspace-tree">
+        <span className="workspace-tree-label">workspace · {preview.files.length} file{preview.files.length === 1 ? '' : 's'}</span>
+        <ul>
+          {preview.files.map((f) => (
+            <li key={f.name}>{f.name}</li>
+          ))}
+        </ul>
+      </div>
       {preview.files.map((f) => (
         <div className="deliverable-file" key={f.name}>
           <p className="mono small deliverable-name">

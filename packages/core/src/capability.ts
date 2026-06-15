@@ -32,10 +32,14 @@ export interface CapabilityProfile {
   role: CapabilityRole;
   /** Egress mode, enforced by the OS net layer + the egress proxy. */
   network: NetworkPolicy;
-  /** May the worker spawn subprocesses? Code-side roles need a shell; open does not. */
+  /** May the worker spawn subprocesses? Code-side roles + full-exec open need a shell. */
   canSpawnProcesses: boolean;
-  /** The OS-enforced tool surface (M6d). 'web' = open research; else terminal. */
-  toolset: 'terminal' | 'web';
+  /**
+   * The tool surface descriptor. 'terminal' = code/task workers; 'full' = M8
+   * full-capability open missions (terminal, code, files, browser, web). The
+   * concrete vendored toolset name is configured in the runtime, not here.
+   */
+  toolset: 'terminal' | 'full';
   /**
    * Logical filesystem grants. The supervisor maps these to concrete,
    * realpath-resolved subtrees at spawn (the worker's own workdir tree, plus
@@ -92,13 +96,16 @@ const PROFILES: Record<CapabilityRole, CapabilityProfile> = {
     toolset: 'terminal',
     filesystem: { writeWorkdir: true, readWorkdirOnly: true },
   },
-  // open research worker: writes deliverables only, no subprocess, web egress
-  // through the proxy (allowlist + SSRF blocks)
+  // M8: full-capability open worker — terminal, code, files, browser, web.
+  // It spawns subprocesses (docker orchestration, or host tools on the local
+  // backend). Web egress still routes through the proxy (allowlist + SSRF).
+  // With the docker backend, the agent's tools execute INSIDE a hardened
+  // container (the security boundary); the worker process stays seatbelt-wrapped.
   open: {
     role: 'open',
     network: 'allowlist',
-    canSpawnProcesses: false,
-    toolset: 'web',
+    canSpawnProcesses: true,
+    toolset: 'full',
     filesystem: { writeWorkdir: true, readWorkdirOnly: true },
   },
 };
@@ -114,11 +121,13 @@ export function resolveCapabilityProfile(role: string): CapabilityProfile {
 }
 
 /**
- * Map a worker's (role, toolset) to its capability-profile key. Open and task
- * missions both spawn role 'worker'; the web toolset distinguishes open.
+ * Map a worker's (role, explicit capability hint) to its profile key. Open and
+ * task missions both spawn role 'worker'; the orchestrator passes an explicit
+ * `capabilityRole` ('open') to distinguish them (M8: the open toolset is no
+ * longer 'web', so it can't be inferred from the toolset string).
  */
-export function capabilityRoleFor(role: string, toolset?: string): string {
-  if (toolset === 'web') return 'open';
+export function capabilityRoleFor(role: string, capabilityRole?: string): string {
+  if (capabilityRole) return capabilityRole; // explicit wins (open vs task)
   if (role === 'worker') return 'task';
   return role; // planner | coder | reviewer
 }

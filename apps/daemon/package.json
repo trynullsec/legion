@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "test": "pnpm run test:fast && pnpm run test:agents",
     "test:fast": "vitest run test/api.test.ts test/approval-api.test.ts",
-    "test:agents": "vitest run --retry=1 --testTimeout=600000 test/workers-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/planning-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/build-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/scan-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/task-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/risk-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/schedule-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/schedule-agent.test.ts && vitest run --retry=1 --testTimeout=900000 test/open-api.test.ts",
+    "test:agents": "vitest run --retry=1 --testTimeout=600000 test/workers-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/planning-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/build-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/scan-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/task-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/risk-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/schedule-api.test.ts && vitest run --retry=1 --testTimeout=600000 test/schedule-agent.test.ts && vitest run --retry=1 --testTimeout=900000 test/open-api.test.ts && vitest run --retry=1 --testTimeout=1200000 test/open-exec.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

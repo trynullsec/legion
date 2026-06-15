@@ -9,7 +9,7 @@
   "scripts": {
     "test": "pnpm run test:fast && pnpm run test:agents",
     "test:fast": "vitest run test/03-open-toolset.test.ts test/04-egress-proxy.test.ts test/06-capability-unit.test.ts",
-    "test:agents": "vitest run --retry=1 --testTimeout=600000 test/01-setup.test.ts test/02-supervisor.test.ts test/05-capability-enforcement.test.ts",
+    "test:agents": "vitest run --retry=1 --testTimeout=900000 test/01-setup.test.ts test/02-supervisor.test.ts test/05-capability-enforcement.test.ts test/07-m8-backend.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

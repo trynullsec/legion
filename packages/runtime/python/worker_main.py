@@ -61,11 +61,12 @@ def main():
     model = os.environ.get("LEGION_MODEL")
     base_url = os.environ.get("LEGION_BASE_URL", "https://openrouter.ai/api/v1")
     max_turns = int(os.environ.get("LEGION_MAX_TURNS", "12"))
-    # M6d: which hermes toolset this worker gets. "terminal" (default) for
-    # code/task workers; "web" for open-mission workers — an explicit
-    # read-only allowlist (exactly web_search + web_extract; no shell, no
-    # file tools, no send). Anything not in the toolset is unreachable.
+    # M6d/M8: which hermes toolset this worker gets. "terminal" (default) for
+    # code/task workers; M8 open-mission workers get the full core toolset
+    # (e.g. "hermes-api-server"). The capability role marks open missions
+    # regardless of the toolset name.
     toolset = os.environ.get("LEGION_TOOLSET", "terminal")
+    is_open = os.environ.get("LEGION_CAPABILITY_ROLE") == "open"
 
     if not task:
         emit("ERROR", message="LEGION_TASK is not set")
@@ -117,14 +118,18 @@ def main():
     except Exception:
         pass
 
-    if toolset == "web":
-        # M6d isolation proof (T75): report, from inside the worker process,
-        # the environment it actually sees. Asserted by the test suite.
+    if is_open:
+        # M6d/M8 isolation proof (T75/T90): report, from inside the worker
+        # process, the environment it actually sees. Asserted by the suite.
         emit(
             "AGENT_STATUS",
             kind="isolation",
             message=json.dumps(
-                {"toolset": toolset, "envKeys": sorted(os.environ.keys())}
+                {
+                    "toolset": toolset,
+                    "backend": os.environ.get("TERMINAL_ENV", "local"),
+                    "envKeys": sorted(os.environ.keys()),
+                }
             ),
         )
 
@@ -150,16 +155,10 @@ def main():
                 f.write(payload)
             emit("AGENT_STATUS", kind="lifecycle", message=f"sealed {seal_file} from final message")
 
-    if toolset == "web":
-        # M6d (pin 4/5): the open agent has NO write tools by design — the
-        # launcher (trusted Legion code) seals the agent's final response as
-        # the deliverable. The only write this process performs is here, into
-        # deliverables/ inside its own workdir.
-        if final.strip():
-            os.makedirs("deliverables", exist_ok=True)
-            with open(os.path.join("deliverables", "report.md"), "w") as f:
-                f.write(final)
-            emit("AGENT_STATUS", kind="lifecycle", message="report sealed to deliverables/report.md")
+    # M8: an open mission's deliverable is whatever the agent produced in its
+    # workspace (collected by the orchestrator) plus its final summary. The
+    # orchestrator captures the final MODEL_MESSAGE as SUMMARY.md — the launcher
+    # no longer single-shot-seals a report (the agent now loops with full tools).
     emit(
         "AGENT_STATUS",
         kind="lifecycle",
