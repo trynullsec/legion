@@ -78,8 +78,13 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      # Deterministic fast tier only: core, db, scanner, board, and the daemon
-      # api + approval suites. No live model/search keys required.
+      # The daemon suites mkdtemp their scratch under <repo>/.tmp, which is
+      # gitignored (so absent on a fresh checkout). Create it up front.
+      - name: Create scratch dir
+        run: mkdir -p .tmp
+
+      # Deterministic fast tier only: core, db, scanner, board, the runtime
+      # unit tier, and the daemon api + approval suites. No live keys required.
       - name: Fast test tier
         run: pnpm test:fast
 
