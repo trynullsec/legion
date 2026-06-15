@@ -34,8 +34,20 @@ export interface ConcreteGrants {
    * connect to in order to orchestrate its container. Granting this unix-socket
    * egress does NOT grant TCP egress — that stays confined to the loopback
    * proxy. When absent, no socket egress is allowed.
+   *
+   * seatbelt matches a CONNECT target on its kernel-resolved REALPATH, so the
+   * grant must be the realpath — and we grant both the given path and its
+   * realpath to cover a symlinked socket (e.g. /var/run/docker.sock →
+   * ~/.docker/run/docker.sock).
    */
   dockerSocket?: string;
+  /**
+   * Documented fallback: if the kernel rejects the path-scoped socket grant,
+   * allow unix-socket egress unscoped (TCP egress STILL confined to the
+   * loopback proxy). Selected by the supervisor's preflight only when the
+   * scoped grant fails.
+   */
+  dockerSocketUnscoped?: boolean;
 }
 
 export class EnforcementUnavailableError extends Error {
@@ -103,12 +115,20 @@ export function buildSeatbeltProfile(
 
   // M8: scoped Docker socket egress for open workers (TCP egress stays
   // proxy-confined; this is unix-socket egress to the local daemon only).
-  if (grants.dockerSocket) {
-    const sock = resolveSafe(grants.dockerSocket);
-    lines.push(
-      `(allow network-outbound (remote unix-socket (path-literal ${sbString(sock)})))`,
-      `(allow file-write* (literal ${sbString(sock)}))`,
-    );
+  // Grant BOTH the given path and its realpath — seatbelt resolves the
+  // CONNECT target to its realpath, while the docker client may dial the
+  // symlink. When the kernel still rejects path-scoping, the supervisor's
+  // preflight flips to the unscoped grant below.
+  if (grants.dockerSocketUnscoped) {
+    lines.push('(allow network-outbound (remote unix-socket))');
+  } else if (grants.dockerSocket) {
+    const paths = [...new Set([grants.dockerSocket, resolveSafe(grants.dockerSocket)])];
+    for (const p of paths) {
+      lines.push(
+        `(allow network-outbound (remote unix-socket (path-literal ${sbString(p)})))`,
+        `(allow file-write* (literal ${sbString(p)}))`,
+      );
+    }
   }
 
   return lines.join('\n') + '\n';

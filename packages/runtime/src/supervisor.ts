@@ -51,6 +51,22 @@ export class DockerUnavailableError extends Error {
   }
 }
 
+/**
+ * M8 fix: the confined worker cannot reach dockerd through its seatbelt grant
+ * (a denied unix-socket connect otherwise HANGS until the worker timeout). The
+ * preflight surfaces it in seconds as this typed error instead.
+ */
+export class DockerUnreachableError extends Error {
+  constructor(readonly detail: string) {
+    super(
+      `refusing to start open worker: dockerd is unreachable under the worker's confinement grant (${detail})`,
+    );
+    this.name = 'DockerUnreachableError';
+  }
+}
+
+const DOCKER_PREFLIGHT_TIMEOUT_MS = 12_000;
+
 /** Is the Docker daemon reachable right now? (cheap `docker version` probe). */
 export function dockerAvailable(): { ok: boolean; detail: string } {
   const r = spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], {
@@ -306,7 +322,7 @@ export class WorkerSupervisor {
     const writePaths = [workdir, env.HOME, env.TMPDIR].filter(
       (p): p is string => typeof p === 'string' && p.length > 0,
     );
-    const grants: ConcreteGrants = {
+    let grants: ConcreteGrants = {
       writePaths: [...new Set(writePaths)],
       readPaths: [...new Set([...writePaths, ...this.config.runtimeReadRoots])],
       denyReadPaths: this.config.secretDenyReadPaths,
@@ -317,6 +333,35 @@ export class WorkerSupervisor {
       // the container (the boundary), not on the seatbelt-confined host process.
       ...(useDocker && dockerSocket ? { dockerSocket } : {}),
     };
+
+    // M8 fix: PRE-FLIGHT the confined dockerd connection so a denied/bad
+    // socket grant fails fast (seconds) as a typed error instead of hanging
+    // for minutes when the agent's first tool call tries `docker run`. Try
+    // the realpath-scoped grant first; if the kernel rejects path-scoping,
+    // fall back to unscoped unix-socket egress (TCP stays proxy-confined);
+    // if neither reaches dockerd, refuse to start. Seatbelt only.
+    if (useDocker && this.enforcer.mechanism === 'seatbelt') {
+      let pf = this.dockerPreflight(profile, grants, tmpdir);
+      if (!pf.ok && grants.dockerSocket) {
+        const widened: ConcreteGrants = {
+          ...grants,
+          dockerSocket: undefined,
+          dockerSocketUnscoped: true,
+        };
+        const pf2 = this.dockerPreflight(profile, widened, tmpdir);
+        if (pf2.ok) {
+          grants = widened;
+          pf = pf2;
+        }
+      }
+      if (!pf.ok) {
+        await this.append(input.missionId, workerId, 'WORKER_FAILED', {
+          reason: 'DOCKER_UNREACHABLE',
+          detail: pf.detail,
+        });
+        throw new DockerUnreachableError(pf.detail);
+      }
+    }
 
     // Record the resolved profile BEFORE any work (pin 4 / T81).
     await this.append(input.missionId, workerId, 'CAPABILITY_PROFILE', {
@@ -453,6 +498,42 @@ export class WorkerSupervisor {
     });
 
     return workerId;
+  }
+
+  /**
+   * Run `docker version` under the EXACT seatbelt grant the worker will use,
+   * with a hard timeout. A working grant returns in ~1s; a denied unix-socket
+   * connect (which would otherwise hang the worker) is killed at the timeout
+   * and reported — turning a multi-minute silent stall into a fast, typed
+   * failure. Returns ok=true only when confined docker actually reached dockerd.
+   */
+  private dockerPreflight(
+    profile: CapabilityProfile,
+    grants: ConcreteGrants,
+    controlDir: string,
+  ): { ok: boolean; detail: string } {
+    const wrapped = this.enforcer.wrap(profile, grants, controlDir, 'docker', [
+      'version',
+      '--format',
+      '{{.Server.Version}}',
+    ]);
+    const r = spawnSync(wrapped.command, wrapped.args, {
+      encoding: 'utf8',
+      timeout: DOCKER_PREFLIGHT_TIMEOUT_MS,
+    });
+    if (r.error) {
+      const killed = (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+      return {
+        ok: false,
+        detail: killed
+          ? `confined dockerd connect timed out after ${DOCKER_PREFLIGHT_TIMEOUT_MS}ms (socket grant denied)`
+          : String(r.error),
+      };
+    }
+    if (r.status !== 0) {
+      return { ok: false, detail: (r.stderr || `exit ${r.status}`).trim().slice(0, 300) };
+    }
+    return { ok: true, detail: `confined dockerd ok (server ${r.stdout.trim()})` };
   }
 
   /**

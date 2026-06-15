@@ -10,6 +10,7 @@ export type { RuntimeConfig, TerminalBackend } from './config.js';
 export {
   dockerAvailable,
   DockerUnavailableError,
+  DockerUnreachableError,
   EnforcementUnavailableError,
   WorkerNotFoundError,
   WorkerNotRunningError,
