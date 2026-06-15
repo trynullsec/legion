@@ -158,6 +158,9 @@ describe('M8 open profile + seatbelt docker grant', () => {
 // ---------- T86: docker lifecycle (auto-detecting) ----------
 
 describe('T86: Docker backend lifecycle', () => {
+  // FIX 2: a DEDICATED pool for this describe, ended only after the worker has
+  // fully completed and the supervisor is shut down — so no in-flight exit
+  // append ever hits a closed pool (the "Cannot use a pool after end" race).
   let pool: Pool;
   let scratch: string;
   beforeAll(async () => {
@@ -169,6 +172,24 @@ describe('T86: Docker backend lifecycle', () => {
     await rm(scratch, { recursive: true, force: true });
     await pool.end();
   });
+
+  /** Poll `docker ps` for the mission-labelled container, up to timeoutMs. */
+  async function containerIds(label: string): Promise<string[]> {
+    const r = await exec('docker', [
+      'ps', '-a', '--filter', `label=${label}`, '--format', '{{.ID}}',
+    ]);
+    return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  }
+  async function waitForContainer(label: string, timeoutMs: number): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    let ids: string[] = [];
+    while (Date.now() < deadline) {
+      ids = await containerIds(label);
+      if (ids.length >= 1) return ids;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    return ids;
+  }
 
   it(
     DOCKER
@@ -204,32 +225,32 @@ describe('T86: Docker backend lifecycle', () => {
         extraEnv: { LEGION_CAPABILITY_ROLE: 'open' },
       });
 
-      // while running, exactly one container carries our mission label, hardened
-      await new Promise((r) => setTimeout(r, 8000));
-      const insp = await exec('docker', [
-        'ps', '-a', '--filter', `label=${label}`, '--format', '{{.ID}}',
-      ]);
-      const ids = insp.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
-      expect(ids.length).toBe(1);
-      const cfg = JSON.parse(
-        (await exec('docker', ['inspect', ids[0]!])).stdout,
-      )[0];
-      expect(cfg.HostConfig.CapDrop).toContain('ALL');
-      expect(cfg.HostConfig.SecurityOpt.join(' ')).toContain('no-new-privileges');
-      expect(cfg.HostConfig.PidsLimit).toBe(256);
-      expect(JSON.stringify(cfg.Mounts)).toContain('/workspace');
+      try {
+        // FIX 2: assert at the RIGHT point — DURING the run. Poll (image pull
+        // can take far longer than a fixed sleep) until the mission's
+        // container appears; it must be exactly one, hardened.
+        const ids = await waitForContainer(label, 180_000);
+        expect(ids.length).toBe(1);
+        const cfg = JSON.parse(
+          (await exec('docker', ['inspect', ids[0]!])).stdout,
+        )[0];
+        expect(cfg.HostConfig.CapDrop).toContain('ALL');
+        expect(cfg.HostConfig.SecurityOpt.join(' ')).toContain('no-new-privileges');
+        expect(cfg.HostConfig.PidsLimit).toBe(256);
+        expect(JSON.stringify(cfg.Mounts)).toContain('/workspace');
 
-      await sup.waitForExit(workerId, 600_000).catch(() => {});
+        await sup.waitForExit(workerId, 600_000);
 
-      // state carried across calls: the workspace file exists on the host mount
-      const ws = dockerWorkspaceDir(path.join(scratch, 'sandboxes'), missionId);
-      expect(existsSync(path.join(ws, 'state.txt'))).toBe(true);
+        // state carried across calls: the workspace file exists on the host mount
+        const ws = dockerWorkspaceDir(path.join(scratch, 'sandboxes'), missionId);
+        expect(existsSync(path.join(ws, 'state.txt'))).toBe(true);
 
-      // container removed on completion
-      const after = await exec('docker', [
-        'ps', '-a', '--filter', `label=${label}`, '--format', '{{.ID}}',
-      ]);
-      expect(after.stdout.trim()).toBe('');
+        // removal-on-completion is correct M8 behavior — the container is gone
+        expect(await containerIds(label)).toEqual([]);
+      } finally {
+        // never let a worker outlive the test (and thus the pool)
+        await sup.shutdown();
+      }
     },
     900_000,
   );
@@ -281,7 +302,11 @@ describe('T89: host safety (docker backend)', () => {
           `Then write /workspace/done.txt and finish.`,
         extraEnv: { LEGION_CAPABILITY_ROLE: 'open' },
       });
-      await sup.waitForExit(workerId, 600_000).catch(() => {});
+      try {
+        await sup.waitForExit(workerId, 600_000);
+      } finally {
+        await sup.shutdown(); // no worker outlives the test/pool
+      }
 
       // the host path the agent named is untouched (the container can't see it)
       expect(existsSync(hostTarget)).toBe(false);
