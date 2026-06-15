@@ -173,20 +173,35 @@ describe('T86: Docker backend lifecycle', () => {
     await pool.end();
   });
 
-  /** Poll `docker ps` for the mission-labelled container, up to timeoutMs. */
-  async function containerIds(label: string): Promise<string[]> {
-    const r = await exec('docker', [
-      'ps', '-a', '--filter', `label=${label}`, '--format', '{{.ID}}',
-    ]);
-    return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  // FIX: observe the mission's container by its UNIQUE /workspace bind mount,
+  // which the Hermes backend always sets (host path contains <missionId>),
+  // rather than by a `legion-mission` label that the backend's extra-args
+  // validation may drop. T89 proves the container is created; this just finds
+  // it reliably. Mission-scoped, so concurrent tests don't collide.
+  async function missionContainers(missionId: string): Promise<string[]> {
+    // hermes tags every container it manages with this label (stable, not ours)
+    const ls = await exec('docker', [
+      'ps', '-a', '--filter', 'label=hermes-agent=1', '--format', '{{.ID}}',
+    ]).catch(() => ({ stdout: '' }));
+    const ids = ls.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    const matched: string[] = [];
+    for (const id of ids) {
+      try {
+        const insp = JSON.parse((await exec('docker', ['inspect', id])).stdout)[0];
+        if (JSON.stringify(insp.Mounts ?? []).includes(missionId)) matched.push(id);
+      } catch {
+        /* container vanished between ps and inspect — ignore */
+      }
+    }
+    return matched;
   }
-  async function waitForContainer(label: string, timeoutMs: number): Promise<string[]> {
+  async function waitForContainer(missionId: string, timeoutMs: number): Promise<string[]> {
     const deadline = Date.now() + timeoutMs;
     let ids: string[] = [];
     while (Date.now() < deadline) {
-      ids = await containerIds(label);
+      ids = await missionContainers(missionId);
       if (ids.length >= 1) return ids;
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 1000));
     }
     return ids;
   }
@@ -203,7 +218,6 @@ describe('T86: Docker backend lifecycle', () => {
         sandboxesRoot: path.join(scratch, 'sandboxes'),
       });
       const missionId = crypto.randomUUID();
-      const label = `legion-mission=${missionId}`;
 
       if (!DOCKER) {
         await expect(
@@ -215,25 +229,31 @@ describe('T86: Docker backend lifecycle', () => {
         return;
       }
 
-      // real container: a 2-step task proving state carries across tool calls
+      // real container: a task that keeps the container alive briefly (sleep)
+      // so the observation window is deterministic, then proves state carries
+      // across tool calls.
       const workerId = await sup.startWorker({
         missionId,
         role: 'worker',
         task:
-          'Use the terminal. Step 1: run `echo legion-m8 > /workspace/state.txt`. ' +
-          'Step 2: run `cat /workspace/state.txt` and confirm it prints legion-m8. Then finish.',
+          'Use the terminal to run these steps. Step 1: `sleep 15`. ' +
+          'Step 2: `echo legion-m8 > /workspace/state.txt`. ' +
+          'Step 3: `cat /workspace/state.txt` (it must print legion-m8). Then finish.',
         extraEnv: { LEGION_CAPABILITY_ROLE: 'open' },
       });
 
       try {
-        // FIX 2: assert at the RIGHT point — DURING the run. Poll (image pull
-        // can take far longer than a fixed sleep) until the mission's
-        // container appears; it must be exactly one, hardened.
-        const ids = await waitForContainer(label, 180_000);
+        // assert at the RIGHT point — DURING the run. Poll by the mission's
+        // unique /workspace mount until its container appears (image pull can
+        // take a while); it must be exactly one, hardened.
+        const ids = await waitForContainer(missionId, 180_000);
         expect(ids.length).toBe(1);
         const cfg = JSON.parse(
           (await exec('docker', ['inspect', ids[0]!])).stdout,
         )[0];
+        // diagnostic: surface the labels the backend actually set on it
+        // eslint-disable-next-line no-console
+        console.log('T86 container labels:', JSON.stringify(cfg.Config?.Labels ?? {}));
         expect(cfg.HostConfig.CapDrop).toContain('ALL');
         expect(cfg.HostConfig.SecurityOpt.join(' ')).toContain('no-new-privileges');
         expect(cfg.HostConfig.PidsLimit).toBe(256);
@@ -246,7 +266,7 @@ describe('T86: Docker backend lifecycle', () => {
         expect(existsSync(path.join(ws, 'state.txt'))).toBe(true);
 
         // removal-on-completion is correct M8 behavior — the container is gone
-        expect(await containerIds(label)).toEqual([]);
+        expect(await missionContainers(missionId)).toEqual([]);
       } finally {
         // never let a worker outlive the test (and thus the pool)
         await sup.shutdown();
