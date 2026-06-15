@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref — the fast tier is the only gate,
+# so there is no value in finishing stale ones.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Fast tier (deterministic)
+    runs-on: ubuntu-latest
+
+    # Postgres for the db / daemon-api / approval suites. We use the pgvector
+    # image because 001_init.sql runs `create extension if not exists vector`.
+    # The schema is applied by the tests themselves (runMigrations in beforeAll),
+    # so there is deliberately no separate migrate step.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: legion
+          POSTGRES_PASSWORD: legion
+          POSTGRES_DB: legion
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U legion -d legion"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Matches the local default in .env.example so tests need no extra wiring.
+      DATABASE_URL: postgres://legion:legion@localhost:5434/legion
+
+    steps:
+      # The vendored hermes-agent submodule is intentionally NOT checked out:
+      # the fast tier never spawns a real worker, so it does not need the runtime.
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4 # version is read from package.json "packageManager"
+
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # uv provides the isolated Python used by setup-scanners.sh for semgrep.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Provisions the real, pinned gitleaks + semgrep into ~/.legion/tools — the
+      # scanner suite runs the real tools and never skips. (Single source of
+      # truth: the same script developers run locally.)
+      - name: Install scan engine (gitleaks + semgrep)
+        run: bash scripts/setup-scanners.sh
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Deterministic fast tier only: core, db, scanner, board, and the daemon
+      # api + approval suites. No live model/search keys required.
+      - name: Fast test tier
+        run: pnpm test:fast
+
+# ---------------------------------------------------------------------------
+# NOTE — the real-worker AGENT tier (`pnpm test:agents`) is deliberately NOT
+# run in CI. By design it requires real model + search API keys, Docker (the
+# sandboxed container backend), OS-level confinement (macOS seatbelt / Linux
+# bwrap), and 20+ minutes of wall time. It is a local, no-mock gate: run it on
+# a developer machine with secrets present:
+#
+#     pnpm test:agents
+#
+# CI proves the deterministic surface; the agent tier proves the live system.
+# ---------------------------------------------------------------------------

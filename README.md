@@ -5,6 +5,7 @@
 <h1 align="center">✦ Nullsec Legion</h1>
 
 <p align="center">
+  <a href="https://github.com/trynullsec/legion/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/trynullsec/legion/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-black?style=for-the-badge" /></a>
   <a href="https://github.com/NousResearch/hermes-agent"><img alt="Inspired by Hermes Agent · Nous Research" src="https://img.shields.io/badge/Inspired%20by-Hermes%20Agent%20%C2%B7%20Nous%20Research-blueviolet?style=for-the-badge" /></a>
   <!-- TODO: replace https://heylegion.io with your docs URL (DOCS_URL) -->
