@@ -403,14 +403,17 @@ describe('T75: open worker isolation', () => {
     await supervisor.waitForExit(workerId, 30_000).catch(() => {});
 
     // the worker's workdir contains nothing but deliverables/ and the
-    // supervisor-provisioned (M1) .tmp scratch dir — which must be EMPTY:
-    // the agent has no write path (no shell tool, no file tools; T71 proves
-    // the registry, this proves the disk)
+    // supervisor-provisioned (M1) .tmp scratch dir. The agent itself wrote no
+    // files (no shell tool, no file tools; T71 proves the registry, this
+    // proves the disk). .tmp holds only Legion's own control file — the M7
+    // seatbelt profile (capability.sb), written by the UNCONFINED supervisor
+    // and already loaded by the kernel at exec — not agent output.
     const workers = await listMissionWorkers(pool, missionId);
     const open = workers.find((w) => w.workerId === workerId)!;
     const entries = await readdir(open.workdir, { withFileTypes: true });
     const names = entries.map((e) => e.name).filter((n) => n !== '.DS_Store').sort();
     expect(names).toEqual(['.tmp', 'deliverables']);
-    expect(await readdir(path.join(open.workdir, '.tmp'))).toEqual([]);
+    const tmp = (await readdir(path.join(open.workdir, '.tmp'))).filter((n) => n !== '.DS_Store');
+    expect(tmp).toEqual(['capability.sb']); // M7 profile only; no agent-written files
   }, 240_000);
 });
