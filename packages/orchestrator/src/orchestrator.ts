@@ -310,6 +310,9 @@ export class Orchestrator {
       workdir,
       timeoutMs: this.plannerTimeoutMs,
       model: this.plannerModel,
+      // robustness: if the model loops trying to write plan.json via the
+      // shell, the launcher seals its final message as plan.json instead.
+      extraEnv: { LEGION_SEAL_FILE: 'plan.json' },
     });
 
     // record the exact prompt for auditability (asserted by T21)
@@ -639,7 +642,12 @@ export class Orchestrator {
       role,
       task,
       workdir,
-      extraEnv,
+      // robustness (M2/M3-fix): the reviewer writes review.json; if the model
+      // loops on the shell write, the launcher seals its final message there.
+      extraEnv:
+        role === 'reviewer'
+          ? { ...extraEnv, LEGION_SEAL_FILE: 'review.json' }
+          : extraEnv,
       model: doing ? this.coderModel : this.reviewerModel,
       // implementing a plan takes far more tool iterations than a review
       maxTurns: open ? 16 : doing ? 40 : undefined,

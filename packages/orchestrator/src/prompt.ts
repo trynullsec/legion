@@ -55,9 +55,16 @@ export function buildPlannerPrompt(
     "(cat > plan.json <<'EOF' ... EOF). After writing it, verify it parses:",
     'python3 -c "import json; json.load(open(\'plan.json\'))" — then finish.',
     '',
-    'IMPORTANT: producing the file is the entire point of your run. Do not',
-    'stop after analyzing the repository — your run is a FAILURE unless',
-    'plan.json exists in the current working directory when you finish.',
+    '',
+    'FAILSAFE: your FINAL MESSAGE must also be the plan as raw JSON — the same',
+    'object, with no prose and no markdown fences. If for any reason the file',
+    'write does not succeed, Legion captures your final message as plan.json.',
+    'So: do not loop retrying a failed write — just make your final answer the',
+    'raw JSON object and finish.',
+    '',
+    'IMPORTANT: producing the plan is the entire point of your run. Do not',
+    'stop after analyzing the repository — your run is a FAILURE unless the',
+    'plan exists (written to plan.json or emitted as your final JSON message).',
   );
 
   return lines.join('\n');
@@ -383,9 +390,11 @@ export function buildDeliverableReviewerPrompt(
     '}',
     'Verify it parses: python3 -c "import json; json.load(open(\'review.json\'))" — then finish.',
     '',
-    'IMPORTANT: do NOT answer with your review as a chat message — the file is',
-    'the only output that counts. Your run is a FAILURE unless review.json',
-    'exists in your current working directory when you finish.',
+    'FAILSAFE: write review.json as above. If the write does not succeed, your',
+    'FINAL MESSAGE must be the raw review JSON (no prose, no markdown fences) —',
+    'Legion captures your final message as review.json. Do not loop retrying a',
+    'failed write. Your run is a FAILURE unless the review exists (written to',
+    'review.json or emitted as your final JSON message).',
   );
   return lines.join('\n');
 }
@@ -429,8 +438,10 @@ export function buildReviewerPrompt(
     '}',
     'Verify it parses: python3 -c "import json; json.load(open(\'review.json\'))" — then finish.',
     '',
-    'IMPORTANT: do NOT answer with your review as a chat message — the file is',
-    'the only output that counts. Your run is a FAILURE unless review.json',
-    'exists in your current working directory when you finish.',
+    'FAILSAFE: write review.json as above. If the write does not succeed, your',
+    'FINAL MESSAGE must be the raw review JSON (no prose, no markdown fences) —',
+    'Legion captures your final message as review.json. Do not loop retrying a',
+    'failed write. Your run is a FAILURE unless the review exists (written to',
+    'review.json or emitted as your final JSON message).',
   ].join('\n');
 }

@@ -19,6 +19,32 @@ def emit(event_type, **payload):
     sys.stdout.flush()
 
 
+def _extract_json(text):
+    """Extract a single JSON object from a model's final message.
+
+    Tolerates ```json fences and surrounding prose by taking the substring
+    from the first '{' to the last '}'. Returns the substring only if it
+    parses as JSON; otherwise returns the raw text (so the orchestrator's
+    schema validation still rejects it as PLAN_INVALID, preserving behavior).
+    """
+    import json as _json
+    import re as _re
+
+    t = text.strip()
+    fence = _re.search(r"```(?:json)?\s*(.*?)```", t, _re.DOTALL)
+    if fence:
+        t = fence.group(1).strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        candidate = t[i : j + 1]
+        try:
+            _json.loads(candidate)
+            return candidate
+        except Exception:
+            return candidate  # invalid JSON → orchestrator records PLAN_INVALID
+    return t
+
+
 def clip(value, limit=4000):
     if isinstance(value, str):
         text = value
@@ -108,6 +134,21 @@ def main():
     final = result.get("final_response") or ""
     if final:
         emit("MODEL_MESSAGE", text=clip(final, 8000), final=True)
+
+    # M2-fix: seal a JSON deliverable from the final message. Models (notably
+    # qwen3-coder) sometimes loop trying to WRITE plan.json/review.json via the
+    # shell and never produce the file. When LEGION_SEAL_FILE is set and the
+    # agent did NOT write it, capture the agent's final message as that file
+    # (extracting the JSON object). The shell heredoc write stays the happy
+    # path — we only seal when the file is missing, so a well-behaved write
+    # wins and we never clobber it.
+    seal_file = os.environ.get("LEGION_SEAL_FILE")
+    if seal_file and final.strip() and not os.path.exists(seal_file):
+        payload = _extract_json(final)
+        if payload:
+            with open(seal_file, "w") as f:
+                f.write(payload)
+            emit("AGENT_STATUS", kind="lifecycle", message=f"sealed {seal_file} from final message")
 
     if toolset == "web":
         # M6d (pin 4/5): the open agent has NO write tools by design — the
