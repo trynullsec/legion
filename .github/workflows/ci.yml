@@ -75,6 +75,17 @@ jobs:
       - name: Install worker runtime (hermes venv)
         run: bash scripts/setup-workers.sh
 
+      # Linux confinement uses bubblewrap (the supervisor REFUSES to spawn a
+      # worker if it is absent — never runs unconfined). The daemon approval
+      # suite spawns one real coder worker, so bwrap must be present here.
+      - name: Install OS sandbox (bubblewrap)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 gates unprivileged user namespaces behind AppArmor;
+          # allow them so bwrap can actually set up its namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+
       - name: Typecheck
         run: pnpm typecheck
 
