@@ -1,0 +1,35 @@
+{
+  "name": "@trynullsec/legion",
+  "version": "0.1.0",
+  "description": "One-command installer for Nullsec Legion — clones, configures, and launches the mission board on a fresh machine.",
+  "type": "module",
+  "bin": {
+    "legion": "bin/legion.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin"
+  ],
+  "keywords": [
+    "legion",
+    "nullsec",
+    "ai-agents",
+    "ai-agent",
+    "installer",
+    "cli",
+    "setup"
+  ],
+  "license": "MIT",
+  "author": "Nullsec",
+  "homepage": "https://github.com/trynullsec/legion#readme",
+  "bugs": {
+    "url": "https://github.com/trynullsec/legion/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trynullsec/legion.git",
+    "directory": "installer"
+  }
+}

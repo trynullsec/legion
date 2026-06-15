@@ -38,20 +38,37 @@ Legion treats agent work the way a serious team treats a change: as a unit of wo
 
 ## Quick Install
 
-> Requires **Node 20+**, **pnpm 10+**, and **Docker** (for the Postgres database).
+> **macOS or Linux**, with **Node 20+**, **git**, and a running **Docker**. (Windows: use [WSL2](https://learn.microsoft.com/windows/wsl/install).)
+
+One command clones, configures, and launches Legion. It checks your environment first and tells you exactly what's missing — nothing runs silently:
+
+```bash
+npx @trynullsec/legion
+```
+
+It prompts for your OpenRouter key (written only to `.env`, never logged), provisions the worker runtime and scanners, brings up Postgres, runs migrations, and opens the board. Use `--dir <path>` to choose where it lands or `--no-start` to set up without launching; see `npx @trynullsec/legion --help`.
+
+<details>
+<summary><strong>Manual install</strong> — the same steps, by hand</summary>
 
 ```bash
 git clone https://github.com/trynullsec/legion.git
 cd legion
 git submodule update --init      # vendored agent runtime (Hermes Agent)
 pnpm install
+bash scripts/setup-workers.sh    # worker runtime (uv-managed Python venv + agent)
+bash scripts/setup-scanners.sh   # gitleaks + semgrep
 cp .env.example .env             # add your OPENROUTER_API_KEY
 docker compose up -d             # Postgres (pgvector) on :5434
 pnpm migrate
 pnpm dev                         # board + API at http://localhost:4242
 ```
 
-Open **http://localhost:4242**, register a passkey, and create your first mission.
+On Linux, also install bubblewrap (`sudo apt-get install -y bubblewrap`): Legion confines every worker at the OS level and refuses to run unconfined.
+
+</details>
+
+Then open **http://localhost:4242**, register a passkey, and create your first mission.
 
 ---
 
