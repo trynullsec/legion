@@ -41,9 +41,11 @@ jobs:
       DATABASE_URL: postgres://legion:legion@localhost:5434/legion
 
     steps:
-      # The vendored hermes-agent submodule is intentionally NOT checked out:
-      # the fast tier never spawns a real worker, so it does not need the runtime.
+      # The runtime fast tier introspects the REAL vendored hermes toolset
+      # registry, so the submodule IS required — it is imported, never spawned.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4 # version is read from package.json "packageManager"
@@ -66,6 +68,12 @@ jobs:
       # truth: the same script developers run locally.)
       - name: Install scan engine (gitleaks + semgrep)
         run: bash scripts/setup-scanners.sh
+
+      # The runtime fast tier (03-open-toolset) resolves the real vendored hermes
+      # toolset registry through this venv — provisioned exactly as developers do
+      # locally. Deterministic: it imports the registry, it does not call a model.
+      - name: Install worker runtime (hermes venv)
+        run: bash scripts/setup-workers.sh
 
       - name: Typecheck
         run: pnpm typecheck
