@@ -64,6 +64,8 @@ pnpm migrate
 pnpm dev                         # board + API at http://localhost:4242
 ```
 
+If port `5434` is already taken (e.g. a second Legion), publish Postgres on another port and keep `DATABASE_URL` in sync — `LEGION_PG_PORT=5500 docker compose up -d`, then set `...@localhost:5500/...` in `.env`. The `npx` installer does this for you automatically.
+
 On Linux, also install bubblewrap (`sudo apt-get install -y bubblewrap`): Legion confines every worker at the OS level and refuses to run unconfined.
 
 </details>

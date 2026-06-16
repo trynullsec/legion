@@ -16,7 +16,7 @@ Each step is idempotent and clearly logged — re-running after a fix is always 
 2. **Fetch** — clones the repository and initializes the vendored agent runtime submodule. If the directory already holds Legion, it offers to update instead.
 3. **Configure** — prompts for your OpenRouter API key (and an optional Tavily key for web research) and writes them to `.env`. **Keys are written only to `.env` — never logged, echoed, or transmitted**, and the file is created with mode `600`.
 4. **Install** — `pnpm install`, then provisions the worker runtime and scan engine.
-5. **Database** — `docker compose up -d`, waits for Postgres to report healthy, then runs migrations.
+5. **Database** — brings up Postgres in a **per-install Compose project** (so two checkouts never collide on the container name), waits for it to report healthy, then runs migrations. If host port `5434` is already in use, it offers to run this install's database on the next free port and keeps `DATABASE_URL` in sync. Re-running in the same directory detects the already-running stack and continues.
 6. **Start** — launches the board at **http://localhost:4242** and prints your next steps.
 
 ## Options

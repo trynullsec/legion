@@ -1,13 +1,16 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: legion-postgres
+    # No hardcoded container_name: Compose derives a per-project name from
+    # COMPOSE_PROJECT_NAME (the installer scopes it per install dir), so two
+    # checkouts never collide. The host port is configurable; default 5434
+    # keeps DATABASE_URL's contract for single-install setups unchanged.
     environment:
       POSTGRES_USER: legion
       POSTGRES_PASSWORD: legion
       POSTGRES_DB: legion
     ports:
-      - "5434:5432"
+      - "${LEGION_PG_PORT:-5434}:5432"
     volumes:
       - legion-pgdata:/var/lib/postgresql/data
     healthcheck:

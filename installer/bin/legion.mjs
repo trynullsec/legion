@@ -10,6 +10,8 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import net from 'node:net';
 import path from 'node:path';
 import readline from 'node:readline';
 import { parseArgs } from 'node:util';
@@ -17,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const REPO = 'https://github.com/trynullsec/legion.git';
 const BOARD_URL = 'http://localhost:4242';
+const DEFAULT_PG_PORT = 5434;
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -65,8 +68,8 @@ function probe(bin, args = ['--version']) {
   return !r.error && r.status === 0;
 }
 /** Capture stdout/stderr without inheriting the terminal. */
-function capture(bin, args) {
-  const r = spawnSync(bin, args, { encoding: 'utf8' });
+function capture(bin, args, opts = {}) {
+  const r = spawnSync(bin, args, { encoding: 'utf8', ...opts });
   return { status: r.status ?? -1, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 }
 /** Run a command with inherited stdio; throw SetupError on failure. Never receives secrets. */
@@ -433,31 +436,134 @@ function install(dir) {
 // ---------------------------------------------------------------------------
 // 5. DATABASE
 // ---------------------------------------------------------------------------
+/** A stable, per-install-dir compose project name so two checkouts never collide. */
+function projectName(dir) {
+  const hash = createHash('sha256').update(path.resolve(dir)).digest('hex').slice(0, 8);
+  return `legion-${hash}`;
+}
+
+/** docker compose, scoped to this install's project. */
+function compose(project, dir, args) {
+  return capture(COMPOSE[0], [...COMPOSE.slice(1), '-p', project, ...args], { cwd: dir });
+}
+function composeRun(project, dir, args, env) {
+  run(COMPOSE[0], [...COMPOSE.slice(1), '-p', project, ...args], { cwd: dir, env });
+}
+
+/** Is something already listening on this host TCP port? */
+function portInUse(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(true));
+    srv.once('listening', () => srv.close(() => resolve(false)));
+    srv.listen(port, '127.0.0.1');
+  });
+}
+async function firstFreePort(from) {
+  for (let p = from; p < from + 50; p++) {
+    if (!(await portInUse(p))) return p;
+  }
+  throw new SetupError(`no free port found in ${from}..${from + 50}`);
+}
+
+/** The host port this project's postgres is already published on, or null. */
+function publishedPgPort(project, dir) {
+  // `compose port` prints e.g. "0.0.0.0:5434"; parse the trailing port.
+  const r = compose(project, dir, ['port', 'postgres', '5432']);
+  if (r.status !== 0 || !r.out) return null;
+  const m = r.out.match(/:(\d+)\s*$/);
+  return m ? Number(m[1]) : null;
+}
+
+/** Read DATABASE_URL's port from .env, if present. */
+function envPgPort(dir) {
+  try {
+    const env = readFileSync(path.join(dir, '.env'), 'utf8');
+    const m = env.match(/^DATABASE_URL=postgres:\/\/[^@]+@[^:]+:(\d+)\//m);
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Rewrite DATABASE_URL's port in .env to match the chosen host port. */
+function writeDbPort(dir, port) {
+  const envPath = path.join(dir, '.env');
+  const env = readFileSync(envPath, 'utf8');
+  const next = env.replace(
+    /^DATABASE_URL=(postgres:\/\/[^@]+@[^:]+:)\d+(\/.*)$/m,
+    `DATABASE_URL=$1${port}$2`,
+  );
+  if (next !== env) writeFileSync(envPath, next, { mode: 0o600 });
+}
+
 async function database(dir) {
   step(5, 'Database \u2014 Postgres');
-  run(COMPOSE[0], [...COMPOSE.slice(1), 'up', '-d'], { cwd: dir });
+  const project = projectName(dir);
 
-  info('Waiting for Postgres to become healthy\u2026');
-  const deadline = Date.now() + 120_000;
-  let healthy = false;
-  while (Date.now() < deadline) {
-    const r = capture('docker', ['inspect', '-f', '{{.State.Health.Status}}', 'legion-postgres']);
-    if (r.status === 0 && r.out === 'healthy') {
-      healthy = true;
-      break;
+  // Idempotent reuse: this install's own stack is already running. Adopt its
+  // published port and continue — re-running must never error.
+  const ownPort = publishedPgPort(project, dir);
+  if (ownPort !== null) {
+    info(`Reusing this install's Postgres (project ${c.dim(project)}, port ${ownPort}).`);
+    writeDbPort(dir, ownPort);
+    await waitHealthy(project, dir);
+    ok('Postgres is healthy');
+    run('pnpm', ['migrate'], { cwd: dir });
+    ok('Database migrations applied');
+    return;
+  }
+
+  // First run for this dir: choose a host port. Prefer .env's value (default
+  // 5434). If it is taken by something else, resolve the conflict.
+  let port = envPgPort(dir) ?? DEFAULT_PG_PORT;
+  if (await portInUse(port)) {
+    const free = await firstFreePort(port + 1);
+    warn(`Host port ${port} is already in use (likely another Legion / Postgres).`);
+    out(`  ${c.dim('You can:')}`);
+    out(`    ${c.dim('a)')} run THIS install's database on a separate free port ${c.bold(String(free))} ${c.dim('(recommended)')}`);
+    out(`    ${c.dim('b)')} keep port ${port} (only safe if that IS the database you want this install to use)`);
+    const choice =
+      ARGS.yes || !process.stdin.isTTY
+        ? 'a'
+        : (await ask(`  Choose [${c.bold('a')}/b]: `)).toLowerCase() || 'a';
+    if (choice === 'b') {
+      info(`Keeping port ${port}. This install will connect to whatever Postgres owns it.`);
+    } else {
+      port = free;
+      info(`Using port ${port} for this install's Postgres.`);
     }
-    await delay(2000);
   }
-  if (!healthy) {
-    fail('Postgres did not become healthy in time', [
-      `Inspect it:  (cd ${dir} && ${COMPOSE.join(' ')} logs postgres)`,
-      'Then re-run the installer \u2014 every step is safe to repeat.',
-    ]);
-  }
-  ok('Postgres is healthy');
+
+  // Lock the choice into .env (the daemon's DATABASE_URL) and pass it to compose.
+  writeDbPort(dir, port);
+  info(`Starting Postgres (project ${c.dim(project)}, host port ${port})\u2026`);
+  composeRun(project, dir, ['up', '-d'], { ...process.env, LEGION_PG_PORT: String(port) });
+
+  await waitHealthy(project, dir);
+  ok(`Postgres is healthy on port ${port}`);
 
   run('pnpm', ['migrate'], { cwd: dir });
   ok('Database migrations applied');
+}
+
+/** Poll the project's postgres container health by compose label (no fixed name). */
+async function waitHealthy(project, dir) {
+  info('Waiting for Postgres to become healthy\u2026');
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const ps = compose(project, dir, ['ps', '-q', 'postgres']);
+    const cid = ps.out.split('\n')[0]?.trim();
+    if (cid) {
+      const h = capture('docker', ['inspect', '-f', '{{.State.Health.Status}}', cid]);
+      if (h.status === 0 && h.out === 'healthy') return;
+    }
+    await delay(2000);
+  }
+  fail('Postgres did not become healthy in time', [
+    `Inspect it:  (cd ${dir} && ${COMPOSE.join(' ')} -p ${project} logs postgres)`,
+    'Then re-run the installer \u2014 every step is safe to repeat.',
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,13 +571,15 @@ async function database(dir) {
 // ---------------------------------------------------------------------------
 function nextSteps(dir) {
   const rel = path.relative(process.cwd(), dir) || '.';
+  const project = projectName(dir);
   out(`\n${c.bold(`${STAR} Legion is set up.`)}`);
   out(`  ${c.dim('1.')} Open ${c.cyan(BOARD_URL)}`);
   out(`  ${c.dim('2.')} Register your passkey (the merge gate is bound to it)`);
   out(`  ${c.dim('3.')} Create your first mission`);
   out('');
-  out(`  ${c.dim('Docs:')}    ${c.cyan('https://github.com/trynullsec/legion#readme')}`);
-  out(`  ${c.dim('Restart:')} cd ${rel} && pnpm dev`);
+  out(`  ${c.dim('Docs:')}     ${c.cyan('https://github.com/trynullsec/legion#readme')}`);
+  out(`  ${c.dim('Restart:')}  cd ${rel} && pnpm dev`);
+  out(`  ${c.dim('Database:')} cd ${rel} && ${COMPOSE.join(' ')} -p ${project} up -d   ${c.dim('(its own scoped stack)')}`);
   out('');
 }
 
