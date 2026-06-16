@@ -446,22 +446,39 @@ function projectName(dir) {
 function compose(project, dir, args) {
   return capture(COMPOSE[0], [...COMPOSE.slice(1), '-p', project, ...args], { cwd: dir });
 }
-function composeRun(project, dir, args, env) {
-  run(COMPOSE[0], [...COMPOSE.slice(1), '-p', project, ...args], { cwd: dir, env });
+
+/** Host ports already published by ANY docker container (the real conflict oracle). */
+function dockerPublishedPorts() {
+  // `docker ps` ports column: e.g. "0.0.0.0:5434->5432/tcp, :::5434->5432/tcp".
+  const r = capture('docker', ['ps', '--format', '{{.Ports}}']);
+  const ports = new Set();
+  for (const m of r.out.matchAll(/:(\d+)->/g)) ports.add(Number(m[1]));
+  return ports;
 }
 
-/** Is something already listening on this host TCP port? */
-function portInUse(port) {
+/** Can we bind this host TCP port ourselves right now? */
+function canBind(port) {
   return new Promise((resolve) => {
     const srv = net.createServer();
-    srv.once('error', () => resolve(true));
-    srv.once('listening', () => srv.close(() => resolve(false)));
-    srv.listen(port, '127.0.0.1');
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => srv.close(() => resolve(true)));
+    srv.listen(port, '0.0.0.0');
   });
 }
+
+/**
+ * A port is "in use" if Docker already publishes it OR we can't bind it.
+ * Docker's docker-proxy can let a second bind succeed at the OS level, so the
+ * docker-published check is the one that actually predicts `compose up`.
+ */
+async function portInUse(port, published = dockerPublishedPorts()) {
+  if (published.has(port)) return true;
+  return !(await canBind(port));
+}
 async function firstFreePort(from) {
+  const published = dockerPublishedPorts();
   for (let p = from; p < from + 50; p++) {
-    if (!(await portInUse(p))) return p;
+    if (!(await portInUse(p, published))) return p;
   }
   throw new SetupError(`no free port found in ${from}..${from + 50}`);
 }
@@ -574,46 +591,47 @@ async function database(dir) {
   }
 
   // First run for this dir: choose a host port. Prefer .env's value (default
-  // 5434). If it is taken by something else, resolve the conflict.
+  // 5434), then advance past anything Docker already publishes / we can't bind.
   let port = envPgPort(dir) ?? DEFAULT_PG_PORT;
   if (await portInUse(port)) {
     const free = await firstFreePort(port + 1);
-    warn(`Host port ${port} is already in use (likely another Legion / Postgres).`);
-    out(`  ${c.dim('You can:')}`);
-    out(`    ${c.dim('a)')} run THIS install's database on a separate free port ${c.bold(String(free))} ${c.dim('(recommended)')}`);
-    out(`    ${c.dim('b)')} keep port ${port} (only safe if that IS the database you want this install to use)`);
-    const choice =
-      ARGS.yes || !process.stdin.isTTY
-        ? 'a'
-        : (await ask(`  Choose [${c.bold('a')}/b]: `)).toLowerCase() || 'a';
-    if (choice === 'b') {
-      info(`Keeping port ${port}. This install will connect to whatever Postgres owns it.`);
-    } else {
-      port = free;
-      info(`Using port ${port} for this install's Postgres.`);
-    }
+    warn(`Host port ${port} is already in use (another Legion / Postgres holds it).`);
+    info(`Using the next free port ${c.bold(String(free))} for this install's Postgres.`);
+    port = free;
   }
 
-  // Lock the choice into .env (the daemon's DATABASE_URL) and pass it to compose.
-  writeDbPort(dir, port);
-  info(`Starting Postgres (project ${c.dim(project)}, host port ${port})\u2026`);
-  try {
-    composeRun(project, dir, ['up', '-d'], { ...process.env, LEGION_PG_PORT: String(port) });
-  } catch (e) {
-    // Last-resort clarity: if compose still hits a container-name collision,
-    // explain it and the one-line fix rather than surfacing a raw exit code.
-    const collision = capture('docker', [
-      'ps', '-a', '--filter', 'name=^/legion-postgres$', '--format', '{{.Names}}',
-    ]).out;
-    if (collision) {
-      fail('A container named "legion-postgres" is blocking startup', [
-        'This is from an older single-install setup that pinned the container name.',
-        'Remove it (your data volume is preserved) and re-run:',
-        `  ${c.cyan('docker rm -f legion-postgres')}`,
-        'Then re-run this installer \u2014 every step is safe to repeat.',
-      ]);
+  // Bring it up, advancing the port if Docker still reports an allocation
+  // conflict (docker-proxy can let our pre-bind probe pass, so the real test is
+  // `compose up` itself). Each attempt rewrites .env's DATABASE_URL to match.
+  const MAX_TRIES = 20;
+  for (let attempt = 0; ; attempt++) {
+    writeDbPort(dir, port); // keep the daemon's DATABASE_URL in lockstep
+    info(`Starting Postgres (project ${c.dim(project)}, host port ${port})\u2026`);
+    const r = capture(
+      COMPOSE[0],
+      [...COMPOSE.slice(1), '-p', project, 'up', '-d'],
+      { cwd: dir, env: { ...process.env, LEGION_PG_PORT: String(port) } },
+    );
+    if (r.status === 0) break;
+
+    const portClash = /port is already allocated|address already in use|Bind for .*failed/i.test(
+      `${r.err}\n${r.out}`,
+    );
+    if (portClash && attempt < MAX_TRIES) {
+      // Tear down the half-created container before retrying on a new port.
+      capture(COMPOSE[0], [...COMPOSE.slice(1), '-p', project, 'down'], { cwd: dir });
+      const next = await firstFreePort(port + 1);
+      warn(`Port ${port} could not be allocated; retrying on ${next}.`);
+      port = next;
+      continue;
     }
-    throw e;
+
+    // Not a port issue (or out of retries) — report the real cause clearly.
+    fail('Could not start Postgres', [
+      r.err || r.out || 'docker compose up failed',
+      `Inspect it:  (cd ${dir} && ${COMPOSE.join(' ')} -p ${project} logs postgres)`,
+      'Then re-run the installer \u2014 every step is safe to repeat.',
+    ]);
   }
 
   await waitHealthy(project, dir);
