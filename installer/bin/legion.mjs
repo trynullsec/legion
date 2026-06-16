@@ -475,6 +475,41 @@ function publishedPgPort(project, dir) {
   return m ? Number(m[1]) : null;
 }
 
+/**
+ * A container literally named `legion-postgres` exists. Older checkouts pin
+ * `container_name: legion-postgres`, which overrides Compose's per-project
+ * naming and collides across installs. Returns { state } or null.
+ */
+function legacyContainer() {
+  const r = capture('docker', [
+    'ps', '-a', '--filter', 'name=^/legion-postgres$',
+    '--format', '{{.State}}',
+  ]);
+  const state = r.out.split('\n')[0]?.trim();
+  return state ? { state } : null;
+}
+
+/**
+ * Defuse a hardcoded `container_name` in the cloned compose file so per-project
+ * naming works. Idempotent; only touches the postgres container_name line.
+ */
+function neutralizeContainerName(dir) {
+  const file = path.join(dir, 'docker-compose.yml');
+  let yml;
+  try {
+    yml = readFileSync(file, 'utf8');
+  } catch {
+    return false;
+  }
+  if (!/^\s*container_name:\s*legion-postgres\s*$/m.test(yml)) return false;
+  const next = yml.replace(
+    /^(\s*)container_name:\s*legion-postgres\s*$/m,
+    '$1# container_name removed by the installer so per-project naming applies',
+  );
+  writeFileSync(file, next);
+  return true;
+}
+
 /** Read DATABASE_URL's port from .env, if present. */
 function envPgPort(dir) {
   try {
@@ -500,6 +535,30 @@ function writeDbPort(dir, port) {
 async function database(dir) {
   step(5, 'Database \u2014 Postgres');
   const project = projectName(dir);
+
+  // If this checkout still pins `container_name: legion-postgres` (older clone),
+  // neutralize it so Compose's per-project naming applies and installs cannot
+  // collide on the literal container name.
+  if (neutralizeContainerName(dir)) {
+    info('Adjusted docker-compose.yml so this install gets its own container name.');
+  }
+
+  // A leftover literal `legion-postgres` container (from an older single-install
+  // setup) blocks compose only if it would reuse that name. With the name
+  // neutralized above, a NEW project will not reuse it — but a stopped/dead one
+  // squatting the name is still worth flagging. Never crash on it.
+  const legacy = legacyContainer();
+  if (legacy && legacy.state !== 'running') {
+    warn(`A stopped container named "legion-postgres" exists (state: ${legacy.state}).`);
+    if (await confirm('Remove this stale container? (your data volume is kept)', true)) {
+      capture('docker', ['rm', '-f', 'legion-postgres']);
+      ok('Removed the stale legion-postgres container');
+    } else {
+      info('Leaving it in place \u2014 this install uses its own per-project container regardless.');
+    }
+  } else if (legacy && legacy.state === 'running') {
+    info('Your existing "legion-postgres" keeps running untouched; this install gets its own.');
+  }
 
   // Idempotent reuse: this install's own stack is already running. Adopt its
   // published port and continue — re-running must never error.
@@ -538,7 +597,24 @@ async function database(dir) {
   // Lock the choice into .env (the daemon's DATABASE_URL) and pass it to compose.
   writeDbPort(dir, port);
   info(`Starting Postgres (project ${c.dim(project)}, host port ${port})\u2026`);
-  composeRun(project, dir, ['up', '-d'], { ...process.env, LEGION_PG_PORT: String(port) });
+  try {
+    composeRun(project, dir, ['up', '-d'], { ...process.env, LEGION_PG_PORT: String(port) });
+  } catch (e) {
+    // Last-resort clarity: if compose still hits a container-name collision,
+    // explain it and the one-line fix rather than surfacing a raw exit code.
+    const collision = capture('docker', [
+      'ps', '-a', '--filter', 'name=^/legion-postgres$', '--format', '{{.Names}}',
+    ]).out;
+    if (collision) {
+      fail('A container named "legion-postgres" is blocking startup', [
+        'This is from an older single-install setup that pinned the container name.',
+        'Remove it (your data volume is preserved) and re-run:',
+        `  ${c.cyan('docker rm -f legion-postgres')}`,
+        'Then re-run this installer \u2014 every step is safe to repeat.',
+      ]);
+    }
+    throw e;
+  }
 
   await waitHealthy(project, dir);
   ok(`Postgres is healthy on port ${port}`);
