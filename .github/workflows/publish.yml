@@ -1,0 +1,52 @@
+name: Publish legion-mcp
+
+# Publishes @trynullsec/legion-mcp to npm with provenance when a GitHub Release
+# tagged `mcp-v*` is published (e.g. mcp-v0.2.0). Provenance requires OIDC, so
+# this runs in CI only — never from a laptop.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # manual run for re-publishing a fixed build
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance (Trusted Publishing)
+
+jobs:
+  publish:
+    name: Publish to npm (provenance)
+    # Only the mcp release tag triggers a publish; other releases are ignored.
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'mcp-v') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+
+      - name: Install (clean, locked)
+        run: npm ci
+
+      # Cheap credibility gate: the bin must at least start and report a version.
+      - name: Smoke test (--version exits 0)
+        run: |
+          v="$(node bin/legion-mcp.mjs --version)"
+          echo "legion-mcp --version => $v"
+          test -n "$v"
+          node bin/legion-mcp.mjs --help > /dev/null
+
+      # provenance is also set in package.json publishConfig; the flag is explicit
+      # here so the intent is obvious at the publish site.
+      - name: Publish with provenance
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

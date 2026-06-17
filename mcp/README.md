@@ -1,10 +1,19 @@
 # @trynullsec/legion-mcp
 
+<p>
+  <a href="https://www.npmjs.com/package/@trynullsec/legion-mcp"><img alt="npm" src="https://img.shields.io/npm/v/@trynullsec/legion-mcp?color=black" /></a>
+  <a href="https://www.npmjs.com/package/@trynullsec/legion-mcp"><img alt="provenance" src="https://img.shields.io/badge/npm-provenance-blueviolet" /></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/npm/l/@trynullsec/legion-mcp?color=black" /></a>
+  <a href="https://modelcontextprotocol.io"><img alt="MCP" src="https://img.shields.io/badge/Model%20Context%20Protocol-server-black" /></a>
+</p>
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server for **[Nullsec Legion](https://github.com/trynullsec/legion)**. It lets an AI client (Cursor, Claude Desktop, …) create, monitor, and review Legion missions through your running daemon.
 
 It is a **thin translation layer** over Legion's HTTP API — each tool wraps one endpoint, adding no business logic.
 
-> **The merge gate stays human.** Approving a merge or delivery is a passkey (WebAuthn) ceremony performed in the board. An MCP client cannot sign it — by design. These tools *surface* when a mission is awaiting your approval and point you to the board; there is no `approve_merge` tool.
+## What it deliberately does not do
+
+**It cannot approve a merge or delivery.** That is a human passkey (WebAuthn) ceremony performed in the Legion board, cryptographically bound to the exact bytes of the diff and scan report. An MCP client has no key and no tool to sign it — by design. The agent can plan, build, scan, and read the result; the irreversible step waits for you. `get_approval_status` *surfaces* when a mission is at that gate and points you to the board. There is no `approve_merge` tool, and there never will be one here.
 
 ## Prerequisites
 
@@ -56,7 +65,9 @@ The server runs over **stdio**. Point your client at it with `npx`.
 }
 ```
 
-Before publishing, run it straight from a checkout instead:
+### Local development
+
+To run it straight from a checkout (e.g. while hacking on the server itself):
 
 ```json
 {
@@ -76,6 +87,7 @@ Before publishing, run it straight from a checkout instead:
 | --- | --- | --- |
 | `LEGION_API_URL` | `http://localhost:4242` | The Legion daemon base URL |
 | `LEGION_API_TOKEN` | _(none)_ | Optional `Bearer` token, if you front the daemon with auth |
+| `LEGION_API_TIMEOUT_MS` | `30000` | Per-request timeout; a hung daemon returns a clean error, never hangs the client |
 
 ## License
 

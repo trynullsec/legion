@@ -13,12 +13,43 @@
  *
  * Transport: stdio (for local clients like Cursor and Claude Desktop).
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
+// Single source of truth for the version (no drift with package.json).
+const pkg = JSON.parse(
+  readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'),
+);
+const VERSION = pkg.version;
+
 const BASE = (process.env.LEGION_API_URL || 'http://localhost:4242').replace(/\/+$/, '');
 const TOKEN = process.env.LEGION_API_TOKEN || ''; // optional bearer, if the daemon is fronted by one
+const TIMEOUT_MS = Number(process.env.LEGION_API_TIMEOUT_MS) || 30_000;
+
+const USAGE = `legion-mcp v${VERSION} — Model Context Protocol server for Nullsec Legion
+
+  A stdio MCP server. It is normally launched by an MCP client (Cursor,
+  Claude Desktop), not run by hand — it speaks JSON-RPC over stdin/stdout.
+
+Usage
+  legion-mcp                 Start the stdio server (for an MCP client)
+  legion-mcp --version|-v    Print the version
+  legion-mcp --help|-h       Show this help
+
+Environment
+  LEGION_API_URL             Legion daemon base URL (default http://localhost:4242)
+  LEGION_API_TOKEN           Optional Bearer token, if the daemon is fronted by auth
+  LEGION_API_TIMEOUT_MS      Per-request timeout in ms (default 30000)
+
+Client config (after install)
+  { "mcpServers": { "legion": {
+      "command": "npx", "args": ["-y", "@trynullsec/legion-mcp"],
+      "env": { "LEGION_API_URL": "http://localhost:4242" } } } }
+`;
 
 // ---------------------------------------------------------------------------
 // daemon HTTP client
@@ -37,16 +68,25 @@ async function api(method, route, body) {
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (TOKEN) headers.authorization = `Bearer ${TOKEN}`;
 
+  // Bound every request so a hung daemon can't hang the tool call forever.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   let res;
   try {
     res = await fetch(`${BASE}${route}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl.signal,
     });
   } catch (e) {
+    if (e?.name === 'AbortError') {
+      throw new DaemonError(0, 'DAEMON_TIMEOUT', `no response within ${TIMEOUT_MS}ms`);
+    }
     // Connection refused etc. — the daemon almost certainly isn't running.
     throw new DaemonError(0, 'DAEMON_UNREACHABLE', String(e?.message || e));
+  } finally {
+    clearTimeout(timer);
   }
 
   const raw = await res.text();
@@ -77,10 +117,13 @@ function tool(run) {
     } catch (e) {
       let msg;
       if (e instanceof DaemonError) {
-        msg =
-          e.code === 'DAEMON_UNREACHABLE'
-            ? `Could not reach the Legion daemon at ${BASE}. Is it running? (pnpm dev) — ${e.raw}`
-            : `Legion API error (${e.status}${e.code ? ` ${e.code}` : ''}): ${e.raw || e.message}`;
+        if (e.code === 'DAEMON_UNREACHABLE') {
+          msg = `Could not reach the Legion daemon at ${BASE}. Is it running? (pnpm dev) — ${e.raw}`;
+        } else if (e.code === 'DAEMON_TIMEOUT') {
+          msg = `The Legion daemon at ${BASE} did not respond in time (${e.raw}). It may be busy or stuck.`;
+        } else {
+          msg = `Legion API error (${e.status}${e.code ? ` ${e.code}` : ''}): ${e.raw || e.message}`;
+        }
       } else {
         msg = `Unexpected error: ${e?.message || String(e)}`;
       }
@@ -139,7 +182,7 @@ function missionSummary(m) {
 // ---------------------------------------------------------------------------
 // server + tools
 // ---------------------------------------------------------------------------
-const server = new McpServer({ name: 'legion-mcp', version: '0.1.0' });
+const server = new McpServer({ name: 'legion-mcp', version: VERSION });
 
 server.registerTool(
   'list_missions',
@@ -156,8 +199,8 @@ server.registerTool(
     },
   },
   tool(async ({ state, kind }) => {
-    const { missions } = await api('GET', '/api/missions');
-    let list = missions;
+    const { missions = [] } = await api('GET', '/api/missions');
+    let list = Array.isArray(missions) ? missions : [];
     if (state) list = list.filter((m) => m.state === state);
     if (kind) list = list.filter((m) => m.kind === kind);
     return {
@@ -338,8 +381,9 @@ server.registerTool(
     inputSchema: {},
   },
   tool(async () => {
-    const { schedules } = await api('GET', '/api/schedules');
-    return { count: schedules.length, schedules };
+    const { schedules = [] } = await api('GET', '/api/schedules');
+    const list = Array.isArray(schedules) ? schedules : [];
+    return { count: list.length, schedules: list };
   }),
 );
 
@@ -360,10 +404,20 @@ server.registerTool(
 // boot
 // ---------------------------------------------------------------------------
 async function main() {
+  const arg = process.argv[2];
+  if (arg === '--version' || arg === '-v') {
+    process.stdout.write(`${VERSION}\n`);
+    return;
+  }
+  if (arg === '--help' || arg === '-h') {
+    process.stdout.write(USAGE);
+    return;
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stderr is safe to log on for stdio servers (stdout is the protocol channel).
-  process.stderr.write(`legion-mcp connected (daemon: ${BASE})\n`);
+  process.stderr.write(`legion-mcp v${VERSION} connected (daemon: ${BASE})\n`);
 }
 
 main().catch((e) => {
