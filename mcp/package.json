@@ -1,0 +1,39 @@
+{
+  "name": "@trynullsec/legion-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for Nullsec Legion — let an AI client create, monitor, and review missions. The passkey merge gate stays in the board.",
+  "type": "module",
+  "bin": {
+    "legion-mcp": "bin/legion-mcp.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin"
+  ],
+  "keywords": [
+    "legion",
+    "nullsec",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "cursor",
+    "claude"
+  ],
+  "license": "MIT",
+  "author": "Nullsec",
+  "homepage": "https://github.com/trynullsec/legion#readme",
+  "bugs": {
+    "url": "https://github.com/trynullsec/legion/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trynullsec/legion.git",
+    "directory": "mcp"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  }
+}

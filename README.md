@@ -207,6 +207,26 @@ These are roadmap, not promises kept. If it is not yet backed by a passing test,
 
 ---
 
+## Use it from your AI client (MCP)
+
+[`@trynullsec/legion-mcp`](mcp/) is a [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cursor, Claude Desktop, or any MCP client create, monitor, and review missions through your running daemon. Point your client at it:
+
+```json
+{
+  "mcpServers": {
+    "legion": {
+      "command": "npx",
+      "args": ["-y", "@trynullsec/legion-mcp"],
+      "env": { "LEGION_API_URL": "http://localhost:4242" }
+    }
+  }
+}
+```
+
+The merge gate stays human: an MCP client can plan, build, and read deliverables, but **approving a merge is a passkey ceremony in the board** — there is no tool to sign it. See [`mcp/README.md`](mcp/README.md).
+
+---
+
 ## Documentation
 
 Full documentation lives at **[heylegion.io](https://heylegion.io)**. <!-- TODO: replace with your docs URL -->
